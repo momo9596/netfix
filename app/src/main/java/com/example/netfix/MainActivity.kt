@@ -10,6 +10,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.webkit.*
+import android.webkit.CookieManager
 import android.widget.*
 import org.json.JSONObject
 import java.net.*
