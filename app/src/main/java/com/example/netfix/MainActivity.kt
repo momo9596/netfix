@@ -43,6 +43,7 @@ class MainActivity : Activity() {
     private lateinit var out: TextView
     private lateinit var web: WebView
     private lateinit var fixBtn: Button
+    private lateinit var restoreBtn: Button
     private var bestCh = 6
     private var bestDns = "1.1.1.1"
     private var bestDns2 = "8.8.8.8"
@@ -51,9 +52,14 @@ class MainActivity : Activity() {
     private var beforeSpeed = -1.0
     private var crowded = false
     private var lowSpeed = false
+    private var lineProblem = false
     private var oldUptime = false
     private var running = false
     private var changed = false
+    private var restoring = false
+    private var restoreWid = ""
+    private var dnsDone = false
+    private var chanDone = false
     private var devices = -1
     private var phase = "status"
     private var ticks = 0
@@ -84,17 +90,26 @@ class MainActivity : Activity() {
         ip = EditText(this).apply { hint = "رقم IP للراوتر"; setText(gateway()); setSingleLine() }
         val diag = Button(this).apply { text = "🚀 افتح الراوتر وابدأ فحص وإصلاح السرعة"; setOnClickListener { openRouter(); diagnose(true) } }
         fixBtn = Button(this).apply { text = "🔁 إعادة محاولة الإصلاح"; isEnabled = false; setOnClickListener { applyFixes() } }
+        restoreBtn = Button(this).apply {
+            text = "↩ استرجاع إعدادات الراوتر السابقة"
+            isEnabled = hasBackup()
+            setOnClickListener { restoreBackup() }
+        }
         val copyBtn = Button(this).apply { text = "📋 نسخ التقرير"; setOnClickListener { copyReport() } }
         out = TextView(this).apply { textSize = 15f; setPadding(0, 16, 0, 16) }
         web = WebView(this).apply {
             settings.javaScriptEnabled = true; settings.domStorageEnabled = true
             layoutParams = LinearLayout.LayoutParams(-1, 1400)
             webChromeClient = object : WebChromeClient() {
-                override fun onJsConfirm(v: WebView, url: String, message: String, result: JsResult): Boolean { result.confirm(); return true }
+                // حماية: لا نوافق أبداً على رسائل استرجاع إعدادات المصنع
+                private fun risky(m: String) = Regex("factory|default|restore|مصنع|افتراض", RegexOption.IGNORE_CASE).containsMatchIn(m)
+                override fun onJsConfirm(v: WebView, url: String, message: String, result: JsResult): Boolean {
+                    if (risky(message)) result.cancel() else result.confirm(); return true
+                }
                 override fun onJsAlert(v: WebView, url: String, message: String, result: JsResult): Boolean { result.confirm(); return true }
             }
         }
-        listOf(ip, diag, out, fixBtn, copyBtn, web).forEach { col.addView(it) }
+        listOf(ip, diag, out, fixBtn, restoreBtn, copyBtn, web).forEach { col.addView(it) }
         setContentView(ScrollView(this).apply { addView(col) })
     }
 
@@ -115,6 +130,27 @@ class MainActivity : Activity() {
     private fun gateway(): String {
         val g = (applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager).dhcpInfo.gateway
         return if (g == 0) "192.168.0.1" else "%d.%d.%d.%d".format(g and 255, g shr 8 and 255, g shr 16 and 255, g shr 24 and 255)
+    }
+
+    // ================= النسخة الاحتياطية والاسترجاع =================
+    private fun hasBackup(): Boolean {
+        val sp = getSharedPreferences("nf", 0)
+        return sp.contains("bk_ch") || sp.contains("bk_dns1")
+    }
+
+    private fun restoreBackup() {
+        if (running) return
+        val sp = getSharedPreferences("nf", 0)
+        if (!hasBackup()) { Toast.makeText(this, "لا توجد نسخة احتياطية", Toast.LENGTH_SHORT).show(); return }
+        restoring = true
+        dnsWorth = sp.contains("bk_dns1")
+        bestDns = sp.getString("bk_dns1", "") ?: ""
+        bestDns2 = sp.getString("bk_dns2", "") ?: ""
+        bestCh = sp.getInt("bk_ch", 0)
+        restoreWid = sp.getString("bk_wd", "") ?: ""
+        crowded = false
+        openRouter()
+        applyFixes()
     }
 
     // ================= أدوات القياس الحقيقية =================
@@ -296,19 +332,17 @@ class MainActivity : Activity() {
             val is24 = info.frequency in 2400..2500
             val curCh = if (is24) (info.frequency - 2407) / 5 else (info.frequency - 5000) / 5
 
-            // 1) قياس السرعة أولاً لاكتشاف الخلل
             say("⏳ فحص الاتصال بالراوتر..."); val (gwMs, gwLoss) = stats({ tcp(gw, 80) })
             say("⏳ فحص استقرار الإنترنت (20 قياساً)..."); val (netMs, jitter, netLoss) = pingStats(20)
             say("⏳ اختبار السرعة (قد يستغرق دقيقة)..."); val (sp, loaded) = speedRetry(); beforeSpeed = sp
             lowSpeed = sp in 0.0..5.0
+            lineProblem = netLoss > 5 || netMs > 120
             val bloat = loaded > 0 && netMs > 0 && loaded - netMs > 150
 
-            // 2) أسرع DNS بالقياس الحي
             say("⏳ قياس أسرع DNS فعلياً (8 مواقع × كل سيرفر)...")
             val ranked = benchmarkDns()
             chooseDns(ranked)
 
-            // 3) القنوات
             say("⏳ مسح القنوات (3 مرات)...")
             val cs = pickChannel(wm, curCh)
             bestCh = cs.best
@@ -319,8 +353,9 @@ class MainActivity : Activity() {
             if (info.linkSpeed in 1..20) causes += "🐌 سرعة وصلة الواي فاي بين هاتفك والراوتر منخفضة (${info.linkSpeed}Mbps)."
             if (is24 && cs.curBad) causes += "📡 تداخل قنوات على القناة $curCh (${cs.count} شبكة قريبة) ← الحل: القناة $bestCh."
             if (is24 && cs.count > 8) causes += "🏘 شبكات كثيرة حولك على 2.4GHz."
+            if (is24 && info.rssi > -65 && wm.is5GHzBandSupported) causes += "⚡ هاتفك يدعم 5GHz وإشارتك جيدة: اتصل بشبكة 5GHz (إن وُجدت) فهي أسرع وأقل ازدحاماً."
             if (gwLoss > 5 || gwMs > 40) causes += "🔌 اتصالك بالراوتر غير مستقر (فقد $gwLoss%، ${gwMs.toInt()}ms): مشكلة واي فاي أو راوتر مضغوط."
-            if (netLoss > 5 || netMs > 120) causes += "🌐 الإنترنت نفسه غير مستقر (${netMs.toInt()}ms، فقد $netLoss%، تذبذب ${jitter.toInt()}ms): غالباً الخط أو المزوّد."
+            if (lineProblem) causes += "🌐 الإنترنت نفسه غير مستقر (${netMs.toInt()}ms، فقد $netLoss%، تذبذب ${jitter.toInt()}ms): غالباً الخط أو المزوّد."
             if (bloat) causes += "📉 عند التحميل يرتفع زمن الاستجابة من ${netMs.toInt()} إلى ${loaded.toInt()}ms: أي تحميل يبطّئ باقي الأجهزة."
             if (dnsWorth && ranked.isNotEmpty()) causes += "🧭 يوجد DNS أسرع بشكل واضح من الحالي ← الحل: $bestDns."
             if (sp in 0.0..5.0) causes += "🐢 سرعة التحميل منخفضة جداً (${fmt(sp)})."
@@ -328,7 +363,7 @@ class MainActivity : Activity() {
 
             primary = when {
                 info.rssi < -75 || gwLoss > 5 || gwMs > 40 -> "المشكلة عندك محلياً: ضعف الواي فاي أو بعدك عن الراوتر أو ازدحام القنوات."
-                netLoss > 5 || netMs > 120 -> "المشكلة في الخط أو شركة الإنترنت (الراوتر سليم)."
+                lineProblem -> "المشكلة في الخط أو شركة الإنترنت (الراوتر سليم)."
                 sp in 0.0..10.0 -> "الواي فاي والراوتر سليمان، والسرعة منخفضة: سرعة الباقة أو الخط أو ازدحام الأجهزة."
                 bloat -> "الخط يزدحم عند التحميل: قلّل الأجهزة أو فعّل QoS في الراوتر."
                 else -> "لا توجد مشكلة واضحة."
@@ -346,66 +381,84 @@ class MainActivity : Activity() {
         }
     }
 
-    // ================= سكربت قراءة وتعديل صفحات الراوتر (السرعة فقط) =================
+    // ================= سكربت عام لمعظم الرواتر (بحث ذكي بالكلمات المفتاحية) =================
+    private fun widParam(): String = if (restoring) restoreWid else if (crowded) "20" else ""
+
     private fun js(ph: String) = """
-    (function(PH,CH,DNS,CROWD,DNS2,DOCHG){
-      var r={found:false,changed:false,pw:false,clicked:false,w:false,info:'',wd:'',md:''};
+    (function(PH,CH,DNS,DNS2,DOCHG,WID,PT){
+      var r={found:false,changed:false,pw:false,clicked:false,w:false,info:'',info2:'',cn:-1,wd:'',md:''};
       function docs(w,a){a.push(w.document);for(var i=0;i<w.frames.length;i++){try{docs(w.frames[i],a)}catch(e){}}return a}
       function vis(e){return e.offsetParent!==null}
       function setv(e,v){e.focus();e.value=v;['input','change','keyup'].forEach(function(t){e.dispatchEvent(new Event(t,{bubbles:true}))})}
       function norm(x){return (x.innerText||x.value||'').trim().replace(/^[-\s]+/,'').toLowerCase()}
       function g(tx,re){var m=tx.match(re);return m?m[1].trim():''}
-      function save(d){var c=[].slice.call(d.querySelectorAll('button,input[type=button],input[type=submit],a')).filter(vis);
-        for(var i=0;i<c.length;i++){if(['save','apply','ok','submit','حفظ','تطبيق'].indexOf(norm(c[i]))>=0){c[i].click();return true}}return false}
+      function ok(a,n){return a===n||(n.length>4&&a.indexOf(n)===0&&a.length<=n.length+10)}
+      function num(o){var m=(o.text||'').match(/^\s*(?:channel\s*)?(\d{1,2})\b/i);if(m)return parseInt(m[1]);
+        var v=(o.value||'');return /^\d{1,2}\b/.test(v)?parseInt(v):-1}
+      function save(d){var nm=['save','apply','ok','submit','save changes','apply changes','confirm','حفظ','تطبيق','تأكيد'];
+        var c=[].slice.call(d.querySelectorAll('button,input[type=button],input[type=submit],a')).filter(vis);
+        for(var i=0;i<c.length;i++){if(nm.indexOf(norm(c[i]))>=0){c[i].click();return true}}return false}
       function menu(names){var ds=docs(window,[]);
-        for(var k=0;k<names.length;k++){for(var j=0;j<ds.length;j++){
-          var al=[].slice.call(ds[j].querySelectorAll('a,li,span,div,td')).filter(function(x){return vis(x)&&x.children.length==0&&norm(x)===names[k]});
-          if(al.length){al[0].click();return true}}}return false}
+        for(var k=0;k<names.length;k++){var n=names[(PT+k)%names.length];
+          for(var j=0;j<ds.length;j++){
+            var al=[].slice.call(ds[j].querySelectorAll('a,li,span,div,td')).filter(function(x){return vis(x)&&x.children.length<=1&&ok(norm(x),n)});
+            if(al.length){al[0].click();return true}}}return false}
       var ds=docs(window,[]);
       for(var i=0;i<ds.length;i++){try{var p=ds[i].querySelector('input[type=password]');if(p&&vis(p)){r.pw=true;return r}}catch(e){}}
       for(var i=0;i<ds.length;i++){try{var d=ds[i];
         var tx='';try{tx=d.body.innerText||''}catch(e){}
         if(PH==='status'){
-          if(/firmware version/i.test(tx)){
+          if(/firmware version|software version|hardware version|system up ?time|device information/i.test(tx)){
             r.found=true;
-            r.info=JSON.stringify({fw:g(tx,/Firmware Version\s*:?\s*([^\n\r]+)/i),hw:g(tx,/Hardware Version\s*:?\s*([^\n\r]+)/i),
+            var vm=(tx+' '+(d.title||'')).match(/tp-?link|huawei|zte|d-?link|tenda|netgear|mercusys|asus|xiaomi|totolink|mikrotik|linksys|zyxel/i);
+            r.info=JSON.stringify({vendor:vm?vm[0]:'',fw:g(tx,/(?:Firmware|Software) Version\s*:?\s*([^\n\r]+)/i),hw:g(tx,/Hardware Version\s*:?\s*([^\n\r]+)/i),
               up:g(tx,/(?:System Up ?Time|Up ?Time|Time Online)\s*:?\s*([^\n\r]+)/i),
               dns:g(tx,/DNS(?: Server)?\s*:?\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3}(?:\s*,?\s*[0-9]{1,3}(?:\.[0-9]{1,3}){3})?)/i)});
             return r}
         } else if(PH==='dns'){
-          var dn=[].slice.call(d.querySelectorAll('input')).filter(function(x){return vis(x)&&x.type!=='hidden'&&/dns/i.test(x.name+x.id)});
-          if(dn.length){r.found=true;r.info=dn[0].value.trim();
+          var dn=[].slice.call(d.querySelectorAll('input')).filter(function(x){
+            return vis(x)&&!x.disabled&&!x.readOnly&&x.type!=='hidden'&&x.type!=='checkbox'&&x.type!=='radio'&&/dns/i.test(x.name+x.id+(x.placeholder||''))});
+          if(dn.length){r.found=true;r.info=dn[0].value.trim();r.info2=dn[1]?dn[1].value.trim():'';
             if(DOCHG&&r.info!==DNS){setv(dn[0],DNS);if(dn[1])setv(dn[1],DNS2);save(d);r.changed=true}
             return r}
         } else if(PH==='clients'){
-          if(/assigned ip/i.test(tx)&&/mac address/i.test(tx)){
+          if(/mac/i.test(tx)&&/client|device|host|station|connected|assigned|جهاز/i.test(tx)){
             var m=tx.match(/(?:[0-9a-f]{2}[-:]){5}[0-9a-f]{2}/gi)||[];var u={};m.forEach(function(x){u[x.toLowerCase()]=1});
-            r.found=true;r.info=String(Object.keys(u).length);return r}
+            if(m.length){r.found=true;r.info=String(Object.keys(u).length);return r}}
         } else if(PH==='chan'){
-          var ss=[].slice.call(d.querySelectorAll('select')).filter(vis),cs=null,ws=null,ms=null;
-          ss.forEach(function(s){var o=[].slice.call(s.options).map(function(x){return x.text.trim()});
-            var j=o.join('|').toLowerCase();
-            if(o.indexOf('1')>=0&&o.indexOf('6')>=0&&o.indexOf('11')>=0)cs=s;
+          var ss=[].slice.call(d.querySelectorAll('select')).filter(function(x){return vis(x)&&!x.disabled}),cs=null,ws=null,ms=null;
+          ss.forEach(function(s){var os=[].slice.call(s.options);
+            var ns=os.map(num).filter(function(n){return n>=0});
+            var j=os.map(function(x){return x.text.trim()}).join('|').toLowerCase();
+            if(ns.indexOf(1)>=0&&ns.indexOf(6)>=0&&ns.indexOf(11)>=0&&ns.every(function(n){return n<=14}))cs=s;
             else if(j.indexOf('20')>=0&&j.indexOf('40')>=0)ws=s;
             else if(/11b|11g|11n|bgn/.test(j))ms=s});
-          if(cs){r.found=true;var cur=cs.options[cs.selectedIndex].text.trim();r.info=cur;var chg=false;
+          if(cs){r.found=true;var co=cs.options[cs.selectedIndex];r.info=co.text.trim();r.cn=num(co);
             r.wd=ws?ws.options[ws.selectedIndex].text.trim():'';r.md=ms?ms.options[ms.selectedIndex].text.trim():'';
-            if(cur!==String(CH)){for(var q=0;q<cs.options.length;q++){if(cs.options[q].text.trim()===String(CH)){cs.selectedIndex=q;break}}cs.dispatchEvent(new Event('change',{bubbles:true}));chg=true}
-            if(CROWD&&ws){for(var q=0;q<ws.options.length;q++){if(/^20/.test(ws.options[q].text.trim())){if(ws.selectedIndex!==q){ws.selectedIndex=q;ws.dispatchEvent(new Event('change',{bubbles:true}));chg=true;r.w=true}break}}}
+            var chg=false,tq=-1;
+            for(var q=0;q<cs.options.length;q++){
+              if(CH===0){if(/auto/i.test(cs.options[q].text)){tq=q;break}}
+              else if(num(cs.options[q])===CH){tq=q;break}}
+            if(tq>=0&&tq!==cs.selectedIndex){cs.selectedIndex=tq;cs.dispatchEvent(new Event('change',{bubbles:true}));chg=true}
+            if(WID&&ws){for(var q=0;q<ws.options.length;q++){
+              var tt=ws.options[q].text.trim();var t2=tt.replace(/\s/g,'').toLowerCase();
+              var hit=(WID==='20')?(t2==='20'||t2==='20mhz'):(tt===WID);
+              if(hit){if(ws.selectedIndex!==q){ws.selectedIndex=q;ws.dispatchEvent(new Event('change',{bubbles:true}));chg=true;r.w=true}break}}}
             if(chg){save(d);r.changed=true}
             return r}
         } else if(PH==='reboot'){
-          var bt=[].slice.call(d.querySelectorAll('input[type=button],input[type=submit],button')).filter(vis).filter(function(x){return norm(x)==='reboot'})[0];
+          var rn=['reboot','restart','reboot router','restart router','reboot now','restart now','إعادة تشغيل','اعادة تشغيل','إعادة التشغيل'];
+          var bt=[].slice.call(d.querySelectorAll('input[type=button],input[type=submit],button')).filter(vis).filter(function(x){return rn.indexOf(norm(x))>=0})[0];
           if(bt){bt.click();r.clicked=true;return r}
         }
       }catch(e){}}
-      if(PH==='status')menu(['status']);
-      else if(PH==='dns')menu(['dhcp settings','dhcp']);
-      else if(PH==='clients')menu(['dhcp clients list']);
-      else if(PH==='chan')menu(['wireless settings','wireless','wi-fi','wlan']);
-      else if(PH==='reboot')menu(['reboot','system tools']);
+      if(PH==='status')menu(['status','device information','device info','overview','system status','home']);
+      else if(PH==='dns')menu(['dhcp settings','dhcp','lan settings','lan','local network','network','internet settings','internet','wan settings','wan']);
+      else if(PH==='clients')menu(['dhcp clients list','dhcp clients','client list','connected devices','device list','attached devices','host list','clients']);
+      else if(PH==='chan')menu(['wireless settings','wireless','wi-fi','wifi','wlan settings','wlan','2.4g wireless','basic settings']);
+      else if(PH==='reboot')menu(['reboot','restart','system tools','system','maintenance','management','administration','tools']);
       return r
-    })(${JSONObject.quote(ph)},${bestCh},${JSONObject.quote(bestDns)},$crowded,${JSONObject.quote(bestDns2)},$dnsWorth)
+    })(${JSONObject.quote(ph)},${bestCh},${JSONObject.quote(bestDns)},${JSONObject.quote(bestDns2)},$dnsWorth,${JSONObject.quote(widParam())},$pt)
     """
 
     private val logoutJs = """
@@ -433,6 +486,7 @@ class MainActivity : Activity() {
     private fun applyFixes() {
         if (running) return
         running = true; phase = "status"; ticks = 0; pt = 0; changed = false; oldUptime = false; devices = -1
+        dnsDone = false; chanDone = false
         report.clear(); audit.clear()
         progress("✍ سجّل دخولك في صفحة الراوتر بالأسفل وسأبدأ الفحص تلقائياً...")
         ui.postDelayed({ step() }, 2000)
@@ -443,11 +497,16 @@ class MainActivity : Activity() {
     private fun nextPhase() {
         val i = order.indexOf(phase)
         if (i >= 0 && i < order.size - 1) moveTo(order[i + 1])
-        else moveTo(if (changed || lowSpeed || oldUptime) "reboot" else "done")
+        else {
+            val needReboot = changed || (!restoring && (oldUptime || (lowSpeed && !lineProblem)))
+            moveTo(if (needReboot) "reboot" else "done")
+        }
     }
 
     private fun parseStatus(s: String) {
         val o = try { JSONObject(s) } catch (e: Exception) { return }
+        val vendor = o.optString("vendor")
+        if (vendor.isNotEmpty()) audit += "🏷 نوع الراوتر: $vendor"
         val fw = o.optString("fw"); val hw = o.optString("hw")
         if (fw.isNotEmpty() || hw.isNotEmpty()) audit += "📋 الراوتر: $hw | فيرموير: $fw"
         val up = o.optString("up")
@@ -472,6 +531,7 @@ class MainActivity : Activity() {
             } else if (r != null) {
                 pt++
                 val found = r.optBoolean("found")
+                val sp = getSharedPreferences("nf", 0)
                 when (phase) {
                     "status" -> {
                         if (found) { parseStatus(r.optString("info")); nextPhase() }
@@ -480,12 +540,14 @@ class MainActivity : Activity() {
                     }
                     "dns" -> {
                         if (found) {
+                            dnsDone = true
                             if (r.optBoolean("changed")) {
                                 changed = true; wait = 5000
-                                report += "🧭 DNS: كان ${r.optString("info")} ← أصبح $bestDns (ثانوي $bestDns2)"
+                                if (!restoring) sp.edit().putString("bk_dns1", r.optString("info")).putString("bk_dns2", r.optString("info2")).apply()
+                                report += "🧭 DNS: كان ${r.optString("info")} ← أصبح $bestDns" + (if (bestDns2.isNotEmpty()) " (ثانوي $bestDns2)" else "")
                             } else audit += "🧭 DNS ${r.optString("info")} مناسب (بدون تغيير)"
                             nextPhase()
-                        } else if (pt > 24) { audit += "🧭 لم أجد إعدادات DNS (تخطّيت)"; nextPhase() }
+                        } else if (pt > 30) { audit += "🧭 لم أجد إعدادات DNS (تخطّيت)"; nextPhase() }
                         else progress("🔎 أبحث عن إعدادات DNS...")
                     }
                     "clients" -> {
@@ -498,15 +560,18 @@ class MainActivity : Activity() {
                     }
                     "chan" -> {
                         if (found) {
+                            chanDone = true
                             val cur = r.optString("info"); val md = r.optString("md"); val wd = r.optString("wd")
+                            val cn = r.optInt("cn", -1)
                             audit += "📡 القناة الحالية: $cur | العرض: ${if (wd.isEmpty()) "—" else wd} | النمط: ${if (md.isEmpty()) "—" else md}"
                             if (r.optBoolean("changed")) {
                                 changed = true; wait = 5000
-                                if (cur != bestCh.toString()) report += "📡 القناة: كانت $cur ← أصبحت $bestCh"
-                                if (r.optBoolean("w")) report += "📶 عرض القناة ← 20MHz (أقل تداخلاً)"
+                                if (!restoring) sp.edit().putInt("bk_ch", cn.coerceAtLeast(0)).putString("bk_wd", wd).apply()
+                                if (cn != bestCh) report += "📡 القناة: كانت ${if (cn <= 0) "تلقائي" else cn.toString()} ← أصبحت ${if (bestCh == 0) "تلقائي" else bestCh.toString()}"
+                                if (r.optBoolean("w")) report += "📶 عرض القناة ← ${if (restoring) restoreWid else "20MHz (أقل تداخلاً)"}"
                             } else audit += "📡 القناة والعرض مناسبان (بدون تغيير)"
                             nextPhase()
-                        } else if (pt > 24) { audit += "📡 لم أجد إعدادات القناة (تخطّيت)"; nextPhase() }
+                        } else if (pt > 30) { audit += "📡 لم أجد إعدادات القناة (تخطّيت)"; nextPhase() }
                         else progress("🔎 أبحث عن إعدادات القناة...")
                     }
                     "reboot" -> {
@@ -516,7 +581,7 @@ class MainActivity : Activity() {
                                 else if (oldUptime) "🔄 إعادة تشغيل الراوتر (يعمل منذ مدة طويلة)"
                                 else "🔄 إعادة تشغيل الراوتر لأن السرعة منخفضة (تنظيف الاتصال)"
                             rebooting()
-                        } else if (pt > 24) {
+                        } else if (pt > 30) {
                             stop = true
                             finish("⚠ لم أجد زر إعادة التشغيل، أعد تشغيل الراوتر يدوياً")
                         } else progress("🔁 أنتقل لصفحة إعادة التشغيل...")
@@ -536,8 +601,8 @@ class MainActivity : Activity() {
             var i = 0
             while (!down && i < 15) { Thread.sleep(3000); if (tcp(gw, 80) < 0) down = true; i++ }
             if (!down) {
-                lastReport = (audit + report).joinToString("\n") + "\n\n⚠ لم أتأكد أن الراوتر أعاد التشغيل (لم ينقطع). أعد تشغيله يدوياً."
-                say(lastReport); running = false
+                lastReport = (audit + report).joinToString("\n") + "\n\n⚠ لم أتأكد أن الراوتر أعاد التشغيل (لم ينقطع). أعد تشغيله يدوياً." + manual()
+                say(lastReport); endRun()
                 return@thread
             }
             var up = false
@@ -545,7 +610,7 @@ class MainActivity : Activity() {
             while (!up && n < 45) { if (tcp(gw, 80) >= 0) up = true else { Thread.sleep(4000); n++ } }
             if (!up) {
                 lastReport = (audit + report).joinToString("\n") + "\n\n⚠ الراوتر لم يرجع بعد. أعد توصيل الواي فاي ثم افحص من جديد."
-                say(lastReport); running = false
+                say(lastReport); endRun()
                 return@thread
             }
             say("✅ الراوتر رجع. جاري قياس السرعة بعد الإصلاح...")
@@ -553,6 +618,11 @@ class MainActivity : Activity() {
             val (after, _) = speedRetry()
             showFinal("✅ تمت إعادة تشغيل الراوتر فعلياً (انقطع ثم رجع)", after)
         }
+    }
+
+    private fun endRun() {
+        running = false; restoring = false
+        runOnUiThread { restoreBtn.isEnabled = hasBackup() }
     }
 
     private fun finish(msg: String) {
@@ -567,6 +637,15 @@ class MainActivity : Activity() {
                 showFinal("$msg\n🚪 تم تسجيل الخروج من الراوتر", after)
             }
         }, 4000)
+    }
+
+    // خطوات يدوية تُعرض تلقائياً لو واجهة الراوتر لم تُفهم آلياً
+    private fun manual(): String {
+        if (restoring) return ""
+        val s = mutableListOf<String>()
+        if (dnsWorth && !dnsDone) s += "• DNS: من إعدادات الراوتر (DHCP أو LAN أو WAN) اجعل الأساسي $bestDns والثانوي $bestDns2"
+        if (!chanDone) s += "• القناة: من Wireless ← 2.4GHz اجعل Channel = $bestCh" + (if (crowded) " وعرض القناة 20MHz" else "")
+        return if (s.isEmpty()) "" else "\n\n🖐 خطوات يدوية (واجهة راوترك مختلفة عن المتوقع):\n" + s.joinToString("\n")
     }
 
     private fun advice(after: Double): String = when {
@@ -588,8 +667,10 @@ class MainActivity : Activity() {
         if (prev > 0) sb.append("🕘 آخر فحص سابق: ${fmt(prev.toDouble())}\n")
         if (after > 0) sp.edit().putFloat("last", after.toFloat()).apply()
         sb.append("\n🎯 التشخيص النهائي: $primary\n").append(advice(after))
+        sb.append(manual())
+        if (hasBackup()) sb.append("\n\n↩ تقدر ترجّع إعدادات الراوتر السابقة بزر «استرجاع».")
         lastReport = sb.toString()
         say(lastReport)
-        running = false
+        endRun()
     }
 }
