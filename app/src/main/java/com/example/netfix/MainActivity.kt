@@ -7,10 +7,17 @@ import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.res.ColorStateList
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.text.InputType
+import android.view.Gravity
+import android.view.View
 import android.webkit.CookieManager
 import android.webkit.HttpAuthHandler
 import android.webkit.JsResult
@@ -20,6 +27,7 @@ import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
@@ -31,6 +39,9 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.URL
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
@@ -39,11 +50,46 @@ data class ChanScan(val best: Int, val count: Int, val curBad: Boolean)
 
 @Suppress("DEPRECATION")
 class MainActivity : Activity() {
+    // ---------- ألوان التصميم ----------
+    private val cBg = Color.parseColor("#0B1220")
+    private val cCard = Color.parseColor("#111B30")
+    private val cLine = Color.parseColor("#1F2C48")
+    private val cText = Color.parseColor("#E8EEF9")
+    private val cMuted = Color.parseColor("#8A9AB8")
+    private val cCyan = Color.parseColor("#22D3EE")
+    private val cBlue = Color.parseColor("#3B82F6")
+    private val cGreen = Color.parseColor("#34D399")
+    private val cAmber = Color.parseColor("#FBBF24")
+    private val cRed = Color.parseColor("#F87171")
+
+    // ---------- عناصر الواجهة ----------
     private lateinit var ip: EditText
-    private lateinit var out: TextView
+    private lateinit var userEt: EditText
+    private lateinit var passEt: EditText
     private lateinit var web: WebView
+    private lateinit var dashScroll: ScrollView
+    private lateinit var startBtn: Button
     private lateinit var fixBtn: Button
     private lateinit var restoreBtn: Button
+    private lateinit var chip: TextView
+    private lateinit var bar: ProgressBar
+    private lateinit var beforeTv: TextView
+    private lateinit var afterTv: TextView
+    private lateinit var gainTv: TextView
+    private lateinit var logView: TextView
+    private lateinit var reportCard: LinearLayout
+    private lateinit var reportView: TextView
+    private lateinit var liveWeb: TextView
+    private lateinit var modeBtn: TextView
+    private val stepViews = mutableListOf<TextView>()
+    private val stepNames = listOf(
+        "فحص الشبكة والسرعة", "قياس أسرع DNS", "مسح القنوات", "الدخول لصفحة الراوتر",
+        "تطبيق DNS", "ضبط القناة والعرض", "إعادة تشغيل الراوتر", "قياس السرعة بعد الإصلاح"
+    )
+    private val stepState = IntArray(8)
+    private var webFull = false
+
+    // ---------- الحالة ----------
     private var bestCh = 6
     private var bestDns = "1.1.1.1"
     private var bestDns2 = "8.8.8.8"
@@ -55,6 +101,7 @@ class MainActivity : Activity() {
     private var lineProblem = false
     private var oldUptime = false
     private var running = false
+    private var diagBusy = false
     private var changed = false
     private var restoring = false
     private var restoreWid = ""
@@ -64,15 +111,19 @@ class MainActivity : Activity() {
     private var phase = "status"
     private var ticks = 0
     private var pt = 0
+    private var loginTries = 0
+    private var rebootTry = 0
+    private var gwIp = ""
     private var primary = ""
     private var diagText = ""
     private var lastReport = ""
+    private var lastLog = ""
+    private val logLines = mutableListOf<String>()
     private val report = mutableListOf<String>()
     private val audit = mutableListOf<String>()
     private val order = listOf("status", "dns", "clients", "chan")
     private val ui = Handler(Looper.getMainLooper())
 
-    // مرشّحو DNS فقط؛ الاختيار النهائي بالقياس الحي
     private val dnsCandidates = listOf(
         "1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4", "9.9.9.9", "149.112.112.112",
         "208.67.222.222", "208.67.220.220", "94.140.14.14", "185.228.168.9"
@@ -82,44 +133,265 @@ class MainActivity : Activity() {
         "amazon.com", "instagram.com", "whatsapp.com", "tiktok.com"
     )
 
+    // ================= بناء الواجهة =================
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    private fun bg(color: Int, r: Int = 16, stroke: Int = 0) = GradientDrawable().apply {
+        setColor(color); cornerRadius = dp(r).toFloat()
+        if (stroke != 0) setStroke(dp(1), stroke)
+    }
+
+    private fun label(t: String, size: Float = 14f, color: Int = cText, bold: Boolean = false) = TextView(this).apply {
+        text = t; textSize = size; setTextColor(color)
+        if (bold) setTypeface(typeface, Typeface.BOLD)
+    }
+
+    private fun cardBox() = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        background = bg(cCard, 18, cLine)
+        setPadding(dp(14), dp(12), dp(14), dp(12))
+        layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) }
+    }
+
+    private fun field(hint: String, pass: Boolean = false) = EditText(this).apply {
+        this.hint = hint; setHintTextColor(cMuted); setTextColor(cText); textSize = 14f
+        setSingleLine(); background = bg(Color.parseColor("#0D1628"), 12, cLine)
+        setPadding(dp(12), dp(10), dp(12), dp(10))
+        if (pass) inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) }
+    }
+
+    private fun gradBtn(t: String, c1: Int, c2: Int) = Button(this).apply {
+        text = t; isAllCaps = false; textSize = 16f; setTextColor(Color.WHITE)
+        setTypeface(typeface, Typeface.BOLD)
+        background = GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, intArrayOf(c1, c2)).apply { cornerRadius = dp(16).toFloat() }
+        layoutParams = LinearLayout.LayoutParams(-1, dp(54)).apply { topMargin = dp(12) }
+    }
+
+    private fun smallBtn(t: String) = Button(this).apply {
+        text = t; isAllCaps = false; textSize = 12f; setTextColor(cText)
+        background = bg(Color.parseColor("#17233D"), 12, cLine)
+        layoutParams = LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginEnd = dp(6) }
+    }
+
+    private fun toolChip(t: String) = TextView(this).apply {
+        text = t; textSize = 14f; setTextColor(cText); gravity = Gravity.CENTER
+        background = bg(Color.parseColor("#1B2A47"), 10)
+        setPadding(dp(12), dp(6), dp(12), dp(6))
+        layoutParams = LinearLayout.LayoutParams(-2, -2).apply { marginStart = dp(6) }
+    }
+
+    private fun statBox(title: String, color: Int): Pair<LinearLayout, TextView> {
+        val v = label("—", 22f, color, true).apply { gravity = Gravity.CENTER }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER
+            background = bg(Color.parseColor("#0D1628"), 14)
+            setPadding(dp(6), dp(10), dp(6), dp(10))
+            layoutParams = LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(6) }
+            addView(label(title, 11f, cMuted).apply { gravity = Gravity.CENTER })
+            addView(v)
+            addView(label("Mbps", 10f, cMuted).apply { gravity = Gravity.CENTER })
+        }
+        return Pair(box, v)
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION), 1)
-        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(32, 48, 32, 32); layoutDirection = android.view.View.LAYOUT_DIRECTION_RTL }
-        ip = EditText(this).apply { hint = "رقم IP للراوتر"; setText(gateway()); setSingleLine() }
-        val diag = Button(this).apply { text = "🚀 افتح الراوتر وابدأ فحص وإصلاح السرعة"; setOnClickListener { openRouter(); diagnose(true) } }
-        fixBtn = Button(this).apply { text = "🔁 إعادة محاولة الإصلاح"; isEnabled = false; setOnClickListener { applyFixes() } }
-        restoreBtn = Button(this).apply {
-            text = "↩ استرجاع إعدادات الراوتر السابقة"
-            isEnabled = hasBackup()
-            setOnClickListener { restoreBackup() }
+        window.statusBarColor = cBg
+        window.navigationBarColor = cBg
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; setBackgroundColor(cBg)
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
         }
-        val copyBtn = Button(this).apply { text = "📋 نسخ التقرير"; setOnClickListener { copyReport() } }
-        out = TextView(this).apply { textSize = 15f; setPadding(0, 16, 0, 16) }
+        dashScroll = ScrollView(this).apply { layoutParams = LinearLayout.LayoutParams(-1, 0, 1f) }
+        val dash = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; setPadding(dp(14), dp(36), dp(14), dp(14))
+        }
+
+        // رأس الصفحة
+        val header = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        val titles = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; layoutParams = LinearLayout.LayoutParams(0, -2, 1f) }
+        titles.addView(label("NetFix Pro", 26f, cText, true))
+        titles.addView(label("تشخيص وتسريع الإنترنت تلقائياً", 12f, cMuted))
+        chip = label("● جاهز", 12f, cGreen, true).apply {
+            setPadding(dp(12), dp(6), dp(12), dp(6)); background = bg(Color.parseColor("#13281F"), 20)
+        }
+        header.addView(titles); header.addView(chip)
+        dash.addView(header)
+
+        // بيانات الراوتر
+        val inCard = cardBox()
+        inCard.addView(label("🌐 بيانات الراوتر", 13f, cMuted))
+        ip = field("عنوان الراوتر (IP)").apply { setText(gateway()) }
+        userEt = field("اسم المستخدم (اختياري للدخول التلقائي)")
+        passEt = field("كلمة المرور (اختياري، لا تُحفظ)", true)
+        inCard.addView(ip); inCard.addView(userEt); inCard.addView(passEt)
+        dash.addView(inCard)
+
+        // الأزرار
+        startBtn = gradBtn("🚀 ابدأ الفحص والإصلاح", cCyan, cBlue)
+        startBtn.setOnClickListener {
+            if (running || diagBusy) return@setOnClickListener
+            startBtn.isEnabled = false
+            openRouter(); diagnose(true)
+        }
+        dash.addView(startBtn)
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) }
+        }
+        fixBtn = smallBtn("🔁 إعادة المحاولة").apply { isEnabled = false; setOnClickListener { openRouter(); applyFixes() } }
+        restoreBtn = smallBtn("↩ استرجاع").apply { isEnabled = hasBackup(); setOnClickListener { restoreBackup() } }
+        val copyBtn = smallBtn("📋 نسخ التقرير").apply { setOnClickListener { copyReport() } }
+        row.addView(fixBtn); row.addView(restoreBtn); row.addView(copyBtn)
+        dash.addView(row)
+
+        // مراحل العمل
+        val stepsCard = cardBox()
+        stepsCard.addView(label("📋 مراحل العمل", 13f, cMuted))
+        bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100; progress = 0
+            progressTintList = ColorStateList.valueOf(cCyan)
+            layoutParams = LinearLayout.LayoutParams(-1, dp(8)).apply { topMargin = dp(8); bottomMargin = dp(6) }
+        }
+        stepsCard.addView(bar)
+        stepNames.forEachIndexed { i, n ->
+            val tv = label("⚪  $n", 14f, cMuted).apply { setPadding(0, dp(5), 0, dp(5)) }
+            stepViews.add(tv); stepsCard.addView(tv)
+            stepState[i] = 0
+        }
+        dash.addView(stepsCard)
+
+        // مقارنة السرعة
+        val spCard = cardBox()
+        spCard.addView(label("📈 السرعة", 13f, cMuted))
+        val spRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) }
+        }
+        val (b1, t1) = statBox("قبل", cAmber); beforeTv = t1
+        val (b2, t2) = statBox("بعد", cGreen); afterTv = t2
+        val (b3, t3) = statBox("التحسّن", cMuted); gainTv = t3
+        spRow.addView(b1); spRow.addView(b2); spRow.addView(b3)
+        spCard.addView(spRow)
+        dash.addView(spCard)
+
+        // السجل المباشر
+        val logCard = cardBox()
+        logCard.addView(label("🛰 ما يحدث الآن", 13f, cMuted))
+        logView = label("بانتظار البدء...", 12f, Color.parseColor("#A7F3D0")).apply {
+            typeface = Typeface.MONOSPACE; setPadding(0, dp(8), 0, 0)
+        }
+        logCard.addView(logView)
+        dash.addView(logCard)
+
+        // التقرير النهائي
+        reportCard = cardBox().apply { visibility = View.GONE }
+        reportCard.addView(label("🧾 التقرير", 13f, cMuted))
+        reportView = label("", 13f, cText).apply { setPadding(0, dp(8), 0, 0); setTextIsSelectable(true) }
+        reportCard.addView(reportView)
+        dash.addView(reportCard)
+
+        dashScroll.addView(dash)
+
+        // شاشة الراوتر المباشرة (قابلة للتكبير والتصغير)
+        val webPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(cCard)
+            layoutParams = LinearLayout.LayoutParams(-1, 0, 1.1f)
+        }
+        val bar2 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+        }
+        liveWeb = label("🖥 شاشة الراوتر المباشرة", 12f, cCyan, true).apply {
+            setSingleLine(); ellipsize = android.text.TextUtils.TruncateAt.END
+            layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+        }
+        val zOut = toolChip("➖"); val zIn = toolChip("➕")
+        modeBtn = toolChip("⛶ تكبير")
+        zOut.setOnClickListener { web.zoomOut() }
+        zIn.setOnClickListener { web.zoomIn() }
+        modeBtn.setOnClickListener {
+            webFull = !webFull
+            dashScroll.visibility = if (webFull) View.GONE else View.VISIBLE
+            modeBtn.text = if (webFull) "⤓ اللوحة" else "⛶ تكبير"
+        }
+        bar2.addView(liveWeb); bar2.addView(zOut); bar2.addView(zIn); bar2.addView(modeBtn)
+        webPanel.addView(bar2)
+
         web = WebView(this).apply {
             settings.javaScriptEnabled = true; settings.domStorageEnabled = true
-            layoutParams = LinearLayout.LayoutParams(-1, 1400)
+            settings.setSupportZoom(true); settings.builtInZoomControls = true
+            settings.displayZoomControls = false
+            settings.useWideViewPort = true; settings.loadWithOverviewMode = true
+            setBackgroundColor(Color.WHITE)
+            layoutParams = LinearLayout.LayoutParams(-1, 0, 1f)
             webChromeClient = object : WebChromeClient() {
-                // حماية: لا نوافق أبداً على رسائل استرجاع إعدادات المصنع
-                private fun risky(m: String) = Regex("factory|default|restore|مصنع|افتراض", RegexOption.IGNORE_CASE).containsMatchIn(m)
+                private fun risky(m: String): Boolean {
+                    val ic = RegexOption.IGNORE_CASE
+                    val rb = Regex("reboot|restart|إعادة تشغيل|اعادة تشغيل", ic).containsMatchIn(m)
+                    return Regex("factory|مصنع", ic).containsMatchIn(m) ||
+                        (!rb && Regex("default|restore|reset|افتراض", ic).containsMatchIn(m))
+                }
                 override fun onJsConfirm(v: WebView, url: String, message: String, result: JsResult): Boolean {
                     if (risky(message)) result.cancel() else result.confirm(); return true
                 }
                 override fun onJsAlert(v: WebView, url: String, message: String, result: JsResult): Boolean { result.confirm(); return true }
             }
         }
-        listOf(ip, diag, out, fixBtn, restoreBtn, copyBtn, web).forEach { col.addView(it) }
-        setContentView(ScrollView(this).apply { addView(col) })
+        webPanel.addView(web)
+
+        root.addView(dashScroll); root.addView(webPanel)
+        setContentView(root)
     }
 
-    private fun say(s: String) = runOnUiThread { out.text = s }
+    // ================= السجل والحالة =================
+    private fun log(s: String) {
+        if (s == lastLog) return
+        lastLog = s
+        val t = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+        synchronized(logLines) {
+            logLines.add("$t  $s")
+            while (logLines.size > 200) logLines.removeAt(0)
+        }
+        val shown = synchronized(logLines) { logLines.takeLast(10).joinToString("\n") }
+        runOnUiThread { logView.text = shown; liveWeb.text = "🖥 $s" }
+    }
 
-    private fun progress(extra: String) =
-        say((listOf("🎯 الخطة: قناة $bestCh + DNS $bestDns") + audit + report + extra).joinToString("\n"))
+    private fun say(s: String) = log(s)
+    private fun progress(extra: String) = log(extra)
+
+    private fun setChip(t: String, color: Int) = runOnUiThread { chip.text = t; chip.setTextColor(color) }
+
+    private fun setStep(i: Int, st: Int) {
+        stepState[i] = st
+        runOnUiThread {
+            val icon = when (st) { 1 -> "⏳"; 2 -> "✅"; 3 -> "⏭"; else -> "⚪" }
+            val col = when (st) { 1 -> cAmber; 2 -> cGreen; else -> cMuted }
+            stepViews[i].text = "$icon  ${stepNames[i]}"
+            stepViews[i].setTextColor(col)
+            bar.progress = stepState.count { it == 2 || it == 3 } * 100 / stepState.size
+        }
+    }
+
+    private fun resetUi() {
+        for (i in stepState.indices) setStep(i, 0)
+        runOnUiThread {
+            beforeTv.text = "—"; afterTv.text = "—"; gainTv.text = "—"; gainTv.setTextColor(cMuted)
+            reportCard.visibility = View.GONE
+        }
+    }
+
+    private fun setReport(t: String) = runOnUiThread { reportView.text = t; reportCard.visibility = View.VISIBLE }
+
+    private fun mb(x: Double) = if (x < 0) "—" else "%.1f".format(x)
 
     private fun copyReport() {
-        val text = if (lastReport.isNotEmpty()) lastReport else out.text.toString()
+        val text = if (lastReport.isNotEmpty()) lastReport else synchronized(logLines) { logLines.joinToString("\n") }
         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         cm.setPrimaryClip(ClipData.newPlainText("report", text))
         Toast.makeText(this, "تم نسخ التقرير", Toast.LENGTH_SHORT).show()
@@ -139,7 +411,7 @@ class MainActivity : Activity() {
     }
 
     private fun restoreBackup() {
-        if (running) return
+        if (running || diagBusy) return
         val sp = getSharedPreferences("nf", 0)
         if (!hasBackup()) { Toast.makeText(this, "لا توجد نسخة احتياطية", Toast.LENGTH_SHORT).show(); return }
         restoring = true
@@ -149,6 +421,8 @@ class MainActivity : Activity() {
         bestCh = sp.getInt("bk_ch", 0)
         restoreWid = sp.getString("bk_wd", "") ?: ""
         crowded = false
+        resetUi()
+        log("↩ استرجاع الإعدادات السابقة للراوتر")
         openRouter()
         applyFixes()
     }
@@ -160,7 +434,6 @@ class MainActivity : Activity() {
         (System.nanoTime() - t) / 1_000_000
     } catch (e: Exception) { -1 }
 
-    // استعلام DNS حقيقي مع التحقق من الرد (نفس الـ ID، بدون خطأ، وفيه إجابة)
     private fun dnsQuery(server: String, host: String, timeout: Int = 1500): Long {
         val id = (Math.random() * 65535).toInt()
         val bo = java.io.ByteArrayOutputStream()
@@ -186,14 +459,12 @@ class MainActivity : Activity() {
 
     private fun dnsUdp(server: String): Long = dnsQuery(server, "example.com")
 
-    // DNS اللي واخدته الشبكة حالياً من المزوّد
     private fun ispDns(): List<String> {
         val d = (applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager).dhcpInfo
         fun ipOf(g: Int) = if (g == 0) null else "%d.%d.%d.%d".format(g and 255, g shr 8 and 255, g shr 16 and 255, g shr 24 and 255)
         return listOfNotNull(ipOf(d.dns1), ipOf(d.dns2))
     }
 
-    // الدرجة = 60% وسيط + 40% متوسط، والفشل بعقوبة 1500ms
     private fun dnsScore(server: String): Double {
         val times = mutableListOf<Long>()
         repeat(2) {
@@ -229,7 +500,6 @@ class MainActivity : Activity() {
             if (dnsWorth) " ← سيتغيّر" else " ← الحالي مناسب"
     }
 
-    // 3 مسحات + استبعاد شبكتك + حساب التداخل بالقدرة (mW)
     private fun pickChannel(wm: WifiManager, curCh: Int): ChanScan {
         val own = wm.connectionInfo.bssid
         val seen = HashMap<String, Int>()
@@ -324,71 +594,98 @@ class MainActivity : Activity() {
 
     // ================= التشخيص من جهة الهاتف =================
     private fun diagnose(auto: Boolean = false) {
+        diagBusy = true
+        gwIp = ip.text.toString().trim()
         fixBtn.isEnabled = false
+        resetUi()
+        setChip("● جارٍ العمل", cAmber)
+        val gw = gwIp
         thread {
-            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            val gw = ip.text.toString().trim()
-            val info = wm.connectionInfo
-            val is24 = info.frequency in 2400..2500
-            val curCh = if (is24) (info.frequency - 2407) / 5 else (info.frequency - 5000) / 5
+            try {
+                val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                val info = wm.connectionInfo
+                val is24 = info.frequency in 2400..2500
+                val curCh = if (is24) (info.frequency - 2407) / 5 else (info.frequency - 5000) / 5
 
-            say("⏳ فحص الاتصال بالراوتر..."); val (gwMs, gwLoss) = stats({ tcp(gw, 80) })
-            say("⏳ فحص استقرار الإنترنت (20 قياساً)..."); val (netMs, jitter, netLoss) = pingStats(20)
-            say("⏳ اختبار السرعة (قد يستغرق دقيقة)..."); val (sp, loaded) = speedRetry(); beforeSpeed = sp
-            lowSpeed = sp in 0.0..5.0
-            lineProblem = netLoss > 5 || netMs > 120
-            val bloat = loaded > 0 && netMs > 0 && loaded - netMs > 150
+                setStep(0, 1)
+                say("⏳ فحص الاتصال بالراوتر..."); val (gwMs, gwLoss) = stats({ tcp(gw, 80) })
+                say("⏳ فحص استقرار الإنترنت (20 قياساً)..."); val (netMs, jitter, netLoss) = pingStats(20)
+                say("⏳ اختبار السرعة (قد يستغرق دقيقة)..."); val (sp, loaded) = speedRetry(); beforeSpeed = sp
+                runOnUiThread { beforeTv.text = mb(sp) }
+                setStep(0, 2)
+                lowSpeed = sp in 0.0..5.0
+                lineProblem = netLoss > 5 || netMs > 120
+                val bloat = loaded > 0 && netMs > 0 && loaded - netMs > 150
 
-            say("⏳ قياس أسرع DNS فعلياً (8 مواقع × كل سيرفر)...")
-            val ranked = benchmarkDns()
-            chooseDns(ranked)
+                setStep(1, 1)
+                say("⏳ قياس أسرع DNS فعلياً (8 مواقع × كل سيرفر)...")
+                val ranked = benchmarkDns()
+                chooseDns(ranked)
+                say(dnsReport)
+                setStep(1, 2)
 
-            say("⏳ مسح القنوات (3 مرات)...")
-            val cs = pickChannel(wm, curCh)
-            bestCh = cs.best
-            crowded = is24 && (cs.count > 5 || cs.curBad)
+                setStep(2, 1)
+                say("⏳ مسح القنوات (3 مرات)...")
+                val cs = pickChannel(wm, curCh)
+                bestCh = cs.best
+                crowded = is24 && (cs.count > 5 || cs.curBad)
+                say("📡 أفضل قناة: $bestCh (${cs.count} شبكة مجاورة)")
+                setStep(2, 2)
 
-            val causes = mutableListOf<String>()
-            if (info.rssi < -75) causes += "📶 إشارة الواي فاي ضعيفة (${info.rssi}dBm): اقترب من الراوتر أو أزل العوائق."
-            if (info.linkSpeed in 1..20) causes += "🐌 سرعة وصلة الواي فاي بين هاتفك والراوتر منخفضة (${info.linkSpeed}Mbps)."
-            if (is24 && cs.curBad) causes += "📡 تداخل قنوات على القناة $curCh (${cs.count} شبكة قريبة) ← الحل: القناة $bestCh."
-            if (is24 && cs.count > 8) causes += "🏘 شبكات كثيرة حولك على 2.4GHz."
-            if (is24 && info.rssi > -65 && wm.is5GHzBandSupported) causes += "⚡ هاتفك يدعم 5GHz وإشارتك جيدة: اتصل بشبكة 5GHz (إن وُجدت) فهي أسرع وأقل ازدحاماً."
-            if (gwLoss > 5 || gwMs > 40) causes += "🔌 اتصالك بالراوتر غير مستقر (فقد $gwLoss%، ${gwMs.toInt()}ms): مشكلة واي فاي أو راوتر مضغوط."
-            if (lineProblem) causes += "🌐 الإنترنت نفسه غير مستقر (${netMs.toInt()}ms، فقد $netLoss%، تذبذب ${jitter.toInt()}ms): غالباً الخط أو المزوّد."
-            if (bloat) causes += "📉 عند التحميل يرتفع زمن الاستجابة من ${netMs.toInt()} إلى ${loaded.toInt()}ms: أي تحميل يبطّئ باقي الأجهزة."
-            if (dnsWorth && ranked.isNotEmpty()) causes += "🧭 يوجد DNS أسرع بشكل واضح من الحالي ← الحل: $bestDns."
-            if (sp in 0.0..5.0) causes += "🐢 سرعة التحميل منخفضة جداً (${fmt(sp)})."
-            if (causes.isEmpty()) causes += "✅ لم أجد مشكلة واضحة."
+                val causes = mutableListOf<String>()
+                if (info.rssi < -75) causes += "📶 إشارة الواي فاي ضعيفة (${info.rssi}dBm): اقترب من الراوتر أو أزل العوائق."
+                if (info.linkSpeed in 1..20) causes += "🐌 سرعة وصلة الواي فاي بين هاتفك والراوتر منخفضة (${info.linkSpeed}Mbps)."
+                if (is24 && cs.curBad) causes += "📡 تداخل قنوات على القناة $curCh (${cs.count} شبكة قريبة) ← الحل: القناة $bestCh."
+                if (is24 && cs.count > 8) causes += "🏘 شبكات كثيرة حولك على 2.4GHz."
+                if (is24 && info.rssi > -65 && wm.is5GHzBandSupported) causes += "⚡ هاتفك يدعم 5GHz وإشارتك جيدة: اتصل بشبكة 5GHz (إن وُجدت) فهي أسرع وأقل ازدحاماً."
+                if (gwLoss > 5 || gwMs > 40) causes += "🔌 اتصالك بالراوتر غير مستقر (فقد $gwLoss%، ${gwMs.toInt()}ms): مشكلة واي فاي أو راوتر مضغوط."
+                if (lineProblem) causes += "🌐 الإنترنت نفسه غير مستقر (${netMs.toInt()}ms، فقد $netLoss%، تذبذب ${jitter.toInt()}ms): غالباً الخط أو المزوّد."
+                if (bloat) causes += "📉 عند التحميل يرتفع زمن الاستجابة من ${netMs.toInt()} إلى ${loaded.toInt()}ms: أي تحميل يبطّئ باقي الأجهزة."
+                if (dnsWorth && ranked.isNotEmpty()) causes += "🧭 يوجد DNS أسرع بشكل واضح من الحالي ← الحل: $bestDns."
+                if (sp in 0.0..5.0) causes += "🐢 سرعة التحميل منخفضة جداً (${fmt(sp)})."
+                if (causes.isEmpty()) causes += "✅ لم أجد مشكلة واضحة."
 
-            primary = when {
-                info.rssi < -75 || gwLoss > 5 || gwMs > 40 -> "المشكلة عندك محلياً: ضعف الواي فاي أو بعدك عن الراوتر أو ازدحام القنوات."
-                lineProblem -> "المشكلة في الخط أو شركة الإنترنت (الراوتر سليم)."
-                sp in 0.0..10.0 -> "الواي فاي والراوتر سليمان، والسرعة منخفضة: سرعة الباقة أو الخط أو ازدحام الأجهزة."
-                bloat -> "الخط يزدحم عند التحميل: قلّل الأجهزة أو فعّل QoS في الراوتر."
-                else -> "لا توجد مشكلة واضحة."
+                primary = when {
+                    info.rssi < -75 || gwLoss > 5 || gwMs > 40 -> "المشكلة عندك محلياً: ضعف الواي فاي أو بعدك عن الراوتر أو ازدحام القنوات."
+                    lineProblem -> "المشكلة في الخط أو شركة الإنترنت (الراوتر سليم)."
+                    sp in 0.0..10.0 -> "الواي فاي والراوتر سليمان، والسرعة منخفضة: سرعة الباقة أو الخط أو ازدحام الأجهزة."
+                    bloat -> "الخط يزدحم عند التحميل: قلّل الأجهزة أو فعّل QoS في الراوتر."
+                    else -> "لا توجد مشكلة واضحة."
+                }
+
+                diagText = "📊 نتائج فحص الهاتف\n" +
+                    "إشارة: ${info.rssi}dBm | ${if (is24) "2.4" else "5"}GHz قناة $curCh | وصلة ${info.linkSpeed}Mbps\n" +
+                    "الراوتر: ${gwMs.toInt()}ms فقد $gwLoss%\n" +
+                    "الإنترنت: ${netMs.toInt()}ms تذبذب ${jitter.toInt()}ms فقد $netLoss%\n" +
+                    "السرعة: ${fmt(sp)} | زمن أثناء التحميل: ${if (loaded > 0) "${loaded.toInt()}ms" else "—"}\n" +
+                    dnsReport + "\n\n" +
+                    "🔎 الأسباب:\n" + causes.joinToString("\n")
+                setReport(diagText + "\n\n🎯 الخطة: قناة $bestCh + DNS $bestDns")
+                diagBusy = false
+                runOnUiThread { fixBtn.isEnabled = true; if (auto) applyFixes() else startBtn.isEnabled = true }
+            } catch (e: Exception) {
+                diagBusy = false
+                log("❌ خطأ أثناء الفحص: ${e.message} (تأكد من تفعيل الموقع وصلاحيات الواي فاي)")
+                setChip("● خطأ", cRed)
+                runOnUiThread { startBtn.isEnabled = true }
             }
-
-            diagText = "📊 نتائج فحص الهاتف\n" +
-                "إشارة: ${info.rssi}dBm | ${if (is24) "2.4" else "5"}GHz قناة $curCh | وصلة ${info.linkSpeed}Mbps\n" +
-                "الراوتر: ${gwMs.toInt()}ms فقد $gwLoss%\n" +
-                "الإنترنت: ${netMs.toInt()}ms تذبذب ${jitter.toInt()}ms فقد $netLoss%\n" +
-                "السرعة: ${fmt(sp)} | زمن أثناء التحميل: ${if (loaded > 0) "${loaded.toInt()}ms" else "—"}\n" +
-                dnsReport + "\n\n" +
-                "🔎 الأسباب:\n" + causes.joinToString("\n")
-            say(diagText + "\n\nالحلول المقترحة: قناة $bestCh + DNS $bestDns")
-            runOnUiThread { fixBtn.isEnabled = true; if (auto) applyFixes() }
         }
     }
 
-    // ================= سكربت عام لمعظم الرواتر (بحث ذكي بالكلمات المفتاحية) =================
+    // ================= سكربت الراوتر (بحث ذكي + تمييز مرئي للعناصر) =================
     private fun widParam(): String = if (restoring) restoreWid else if (crowded) "20" else ""
 
-    private fun js(ph: String) = """
-    (function(PH,CH,DNS,DNS2,DOCHG,WID,PT){
-      var r={found:false,changed:false,pw:false,clicked:false,w:false,info:'',info2:'',cn:-1,wd:'',md:''};
+    private fun q(s: String): String = JSONObject.quote(s)
+
+    private fun js(ph: String): String {
+        val user = userEt.text.toString()
+        val pass = if (loginTries < 2) passEt.text.toString() else ""
+        return """
+    (function(PH,CH,DNS,DNS2,DOCHG,WID,PT,USER,PASS){
+      var r={found:false,changed:false,pw:false,clicked:false,w:false,info:'',info2:'',cn:-1,wd:'',md:'',dbg:''};
       function docs(w,a){a.push(w.document);for(var i=0;i<w.frames.length;i++){try{docs(w.frames[i],a)}catch(e){}}return a}
       function vis(e){return e.offsetParent!==null}
+      function hl(e){try{e.style.outline='3px solid #22d3ee';e.style.backgroundColor='#fef9c3';e.scrollIntoView({block:'center'})}catch(x){}}
       function setv(e,v){e.focus();e.value=v;['input','change','keyup'].forEach(function(t){e.dispatchEvent(new Event(t,{bubbles:true}))})}
       function norm(x){return (x.innerText||x.value||'').trim().replace(/^[-\s]+/,'').toLowerCase()}
       function g(tx,re){var m=tx.match(re);return m?m[1].trim():''}
@@ -402,9 +699,19 @@ class MainActivity : Activity() {
         for(var k=0;k<names.length;k++){var n=names[(PT+k)%names.length];
           for(var j=0;j<ds.length;j++){
             var al=[].slice.call(ds[j].querySelectorAll('a,li,span,div,td')).filter(function(x){return vis(x)&&x.children.length<=1&&ok(norm(x),n)});
-            if(al.length){al[0].click();return true}}}return false}
+            if(al.length){hl(al[0]);al[0].click();return true}}}return false}
+      function login(dd,p){try{
+        var us=[].slice.call(dd.querySelectorAll('input')).filter(function(x){return vis(x)&&!x.readOnly&&(x.type==='text'||x.type==='email'||x.type==='')});
+        if(us.length&&USER){setv(us[0],USER);hl(us[0])}
+        setv(p,PASS);hl(p);
+        setTimeout(function(){
+          var ln=['login','log in','sign in','ok','submit','enter','دخول','تسجيل الدخول'];
+          var bs=[].slice.call(dd.querySelectorAll('button,input[type=button],input[type=submit],a,span,div')).filter(function(x){return vis(x)&&x.children.length<=1&&ln.indexOf(norm(x))>=0});
+          if(bs.length){bs[0].click()}else{p.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',keyCode:13,bubbles:true}))}
+        },600)}catch(e){}}
       var ds=docs(window,[]);
-      for(var i=0;i<ds.length;i++){try{var p=ds[i].querySelector('input[type=password]');if(p&&vis(p)){r.pw=true;return r}}catch(e){}}
+      for(var i=0;i<ds.length;i++){try{var p=ds[i].querySelector('input[type=password]');
+        if(p&&vis(p)){r.pw=true;if(PASS){login(ds[i],p)}return r}}catch(e){}}
       for(var i=0;i<ds.length;i++){try{var d=ds[i];
         var tx='';try{tx=d.body.innerText||''}catch(e){}
         if(PH==='status'){
@@ -418,8 +725,8 @@ class MainActivity : Activity() {
         } else if(PH==='dns'){
           var dn=[].slice.call(d.querySelectorAll('input')).filter(function(x){
             return vis(x)&&!x.disabled&&!x.readOnly&&x.type!=='hidden'&&x.type!=='checkbox'&&x.type!=='radio'&&/dns/i.test(x.name+x.id+(x.placeholder||''))});
-          if(dn.length){r.found=true;r.info=dn[0].value.trim();r.info2=dn[1]?dn[1].value.trim():'';
-            if(DOCHG&&r.info!==DNS){setv(dn[0],DNS);if(dn[1])setv(dn[1],DNS2);save(d);r.changed=true}
+          if(dn.length){r.found=true;r.info=dn[0].value.trim();r.info2=dn[1]?dn[1].value.trim():'';hl(dn[0]);if(dn[1])hl(dn[1]);
+            if(DOCHG&&r.info!==DNS){setv(dn[0],DNS);if(dn[1])setv(dn[1],DNS2);setTimeout(function(){save(d)},700);r.changed=true}
             return r}
         } else if(PH==='clients'){
           if(/mac/i.test(tx)&&/client|device|host|station|connected|assigned|جهاز/i.test(tx)){
@@ -435,7 +742,7 @@ class MainActivity : Activity() {
             else if(/11b|11g|11n|bgn/.test(j))ms=s});
           if(cs){r.found=true;var co=cs.options[cs.selectedIndex];r.info=co.text.trim();r.cn=num(co);
             r.wd=ws?ws.options[ws.selectedIndex].text.trim():'';r.md=ms?ms.options[ms.selectedIndex].text.trim():'';
-            var chg=false,tq=-1;
+            var chg=false,tq=-1;hl(cs);
             for(var q=0;q<cs.options.length;q++){
               if(CH===0){if(/auto/i.test(cs.options[q].text)){tq=q;break}}
               else if(num(cs.options[q])===CH){tq=q;break}}
@@ -443,13 +750,17 @@ class MainActivity : Activity() {
             if(WID&&ws){for(var q=0;q<ws.options.length;q++){
               var tt=ws.options[q].text.trim();var t2=tt.replace(/\s/g,'').toLowerCase();
               var hit=(WID==='20')?(t2==='20'||t2==='20mhz'):(tt===WID);
-              if(hit){if(ws.selectedIndex!==q){ws.selectedIndex=q;ws.dispatchEvent(new Event('change',{bubbles:true}));chg=true;r.w=true}break}}}
-            if(chg){save(d);r.changed=true}
+              if(hit){hl(ws);if(ws.selectedIndex!==q){ws.selectedIndex=q;ws.dispatchEvent(new Event('change',{bubbles:true}));chg=true;r.w=true}break}}}
+            if(chg){setTimeout(function(){save(d)},700);r.changed=true}
             return r}
         } else if(PH==='reboot'){
           var rn=['reboot','restart','reboot router','restart router','reboot now','restart now','إعادة تشغيل','اعادة تشغيل','إعادة التشغيل'];
-          var bt=[].slice.call(d.querySelectorAll('input[type=button],input[type=submit],button')).filter(vis).filter(function(x){return rn.indexOf(norm(x))>=0})[0];
-          if(bt){bt.click();r.clicked=true;return r}
+          var cands=[].slice.call(d.querySelectorAll('input[type=button],input[type=submit],button,a,span,div,td,li')).filter(function(x){return vis(x)&&x.children.length<=1&&rn.indexOf(norm(x))>=0});
+          var bt=cands.filter(function(x){return /^(button|input)$/i.test(x.tagName)})[0];
+          if(!bt){bt=cands.filter(function(x){return /btn|button/i.test(x.className+'')||x.getAttribute('role')==='button'})[0]}
+          if(!bt&&PT>=8&&cands.length){bt=cands[cands.length-1]}
+          if(bt){hl(bt);setTimeout(function(){bt.click()},700);r.clicked=true;return r}
+          if(PT>=10){r.dbg+=[].slice.call(d.querySelectorAll('a,button,input[type=button],input[type=submit]')).filter(vis).map(function(x){return norm(x)}).filter(function(t){return t&&t.length<30}).slice(0,25).join(' | ')+' || '}
         }
       }catch(e){}}
       if(PH==='status')menu(['status','device information','device info','overview','system status','home']);
@@ -458,7 +769,17 @@ class MainActivity : Activity() {
       else if(PH==='chan')menu(['wireless settings','wireless','wi-fi','wifi','wlan settings','wlan','2.4g wireless','basic settings']);
       else if(PH==='reboot')menu(['reboot','restart','system tools','system','maintenance','management','administration','tools']);
       return r
-    })(${JSONObject.quote(ph)},${bestCh},${JSONObject.quote(bestDns)},${JSONObject.quote(bestDns2)},$dnsWorth,${JSONObject.quote(widParam())},$pt)
+    })(${q(ph)},${bestCh},${q(bestDns)},${q(bestDns2)},$dnsWorth,${q(widParam())},$pt,${q(user)},${q(pass)})
+    """
+    }
+
+    // نوافذ التأكيد المخصصة (HTML) بعد الضغط على Reboot
+    private val confirmJs = """
+    (function(){function docs(w,a){a.push(w.document);for(var i=0;i<w.frames.length;i++){try{docs(w.frames[i],a)}catch(e){}}return a}
+    var ok=['ok','yes','confirm','continue','نعم','موافق','تأكيد','reboot','restart'];
+    docs(window,[]).forEach(function(d){try{var c=[].slice.call(d.querySelectorAll('button,input[type=button],input[type=submit],a,span,div')).filter(function(x){
+      return x.offsetParent!==null&&x.children.length<=1&&ok.indexOf((x.innerText||x.value||'').trim().toLowerCase())>=0});
+      if(c.length){c[c.length-1].click()}}catch(e){}})})()
     """
 
     private val logoutJs = """
@@ -471,6 +792,10 @@ class MainActivity : Activity() {
     private fun openRouter() {
         web.webViewClient = object : WebViewClient() {
             override fun onReceivedHttpAuthRequest(v: WebView, h: HttpAuthHandler, hs: String, r: String) {
+                val u0 = userEt.text.toString(); val p0 = passEt.text.toString()
+                if (u0.isNotEmpty() && p0.isNotEmpty() && loginTries < 2) {
+                    loginTries++; h.proceed(u0, p0); return
+                }
                 val box = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 20, 40, 0) }
                 val u = EditText(this@MainActivity).apply { hint = "اسم المستخدم" }
                 val p = EditText(this@MainActivity).apply { hint = "كلمة المرور"; inputType = 129 }
@@ -486,13 +811,26 @@ class MainActivity : Activity() {
     private fun applyFixes() {
         if (running) return
         running = true; phase = "status"; ticks = 0; pt = 0; changed = false; oldUptime = false; devices = -1
-        dnsDone = false; chanDone = false
+        dnsDone = false; chanDone = false; loginTries = 0; rebootTry = 0
+        gwIp = ip.text.toString().trim()
         report.clear(); audit.clear()
-        progress("✍ سجّل دخولك في صفحة الراوتر بالأسفل وسأبدأ الفحص تلقائياً...")
+        setChip("● جارٍ العمل", cAmber)
+        runOnUiThread { startBtn.isEnabled = false }
+        setStep(3, 1)
+        log(if (passEt.text.isNotEmpty()) "🔐 سأسجّل الدخول تلقائياً ثم أبدأ الضبط" else "✍ سجّل دخولك في صفحة الراوتر بالأسفل وسأكمل تلقائياً")
         ui.postDelayed({ step() }, 2000)
     }
 
-    private fun moveTo(p: String) { phase = p; pt = 0 }
+    private fun moveTo(p: String) {
+        phase = p; pt = 0; loginTries = 0
+        when (p) {
+            "dns" -> { setStep(3, 2); setStep(4, 1) }
+            "clients" -> setStep(4, if (dnsDone) 2 else 3)
+            "chan" -> setStep(5, 1)
+            "reboot" -> { setStep(5, if (chanDone) 2 else 3); setStep(6, 1) }
+            "done" -> { setStep(5, if (chanDone) 2 else 3); setStep(6, 3) }
+        }
+    }
 
     private fun nextPhase() {
         val i = order.indexOf(phase)
@@ -506,7 +844,7 @@ class MainActivity : Activity() {
     private fun parseStatus(s: String) {
         val o = try { JSONObject(s) } catch (e: Exception) { return }
         val vendor = o.optString("vendor")
-        if (vendor.isNotEmpty()) audit += "🏷 نوع الراوتر: $vendor"
+        if (vendor.isNotEmpty()) { audit += "🏷 نوع الراوتر: $vendor"; log("🏷 تم التعرّف على الراوتر: $vendor") }
         val fw = o.optString("fw"); val hw = o.optString("hw")
         if (fw.isNotEmpty() || hw.isNotEmpty()) audit += "📋 الراوتر: $hw | فيرموير: $fw"
         val up = o.optString("up")
@@ -527,16 +865,17 @@ class MainActivity : Activity() {
             var wait = 2500L
             var stop = false
             if (r != null && r.optBoolean("pw")) {
-                progress("✍ بانتظار تسجيل دخولك في صفحة الراوتر...")
+                loginTries++
+                log(if (passEt.text.isNotEmpty() && loginTries <= 2) "🔐 أسجّل الدخول تلقائياً..." else "✍ بانتظار تسجيل دخولك في صفحة الراوتر...")
             } else if (r != null) {
                 pt++
                 val found = r.optBoolean("found")
                 val sp = getSharedPreferences("nf", 0)
                 when (phase) {
                     "status" -> {
-                        if (found) { parseStatus(r.optString("info")); nextPhase() }
-                        else if (pt > 12) { audit += "📋 تعذّر قراءة صفحة الحالة"; nextPhase() }
-                        else progress("🔎 أفتح صفحة حالة الراوتر...")
+                        if (found) { log("✅ قرأت صفحة حالة الراوتر"); parseStatus(r.optString("info")); nextPhase() }
+                        else if (pt > 12) { audit += "📋 تعذّر قراءة صفحة الحالة"; log("⏭ تخطّي صفحة الحالة"); nextPhase() }
+                        else log("🔎 أفتح صفحة حالة الراوتر...")
                     }
                     "dns" -> {
                         if (found) {
@@ -544,19 +883,21 @@ class MainActivity : Activity() {
                             if (r.optBoolean("changed")) {
                                 changed = true; wait = 5000
                                 if (!restoring) sp.edit().putString("bk_dns1", r.optString("info")).putString("bk_dns2", r.optString("info2")).apply()
-                                report += "🧭 DNS: كان ${r.optString("info")} ← أصبح $bestDns" + (if (bestDns2.isNotEmpty()) " (ثانوي $bestDns2)" else "")
-                            } else audit += "🧭 DNS ${r.optString("info")} مناسب (بدون تغيير)"
+                                val m = "🧭 DNS: كان ${r.optString("info")} ← أصبح $bestDns" + (if (bestDns2.isNotEmpty()) " (ثانوي $bestDns2)" else "")
+                                report += m; log(m)
+                            } else { audit += "🧭 DNS ${r.optString("info")} مناسب (بدون تغيير)"; log("🧭 DNS الحالي مناسب، لا تغيير") }
                             nextPhase()
-                        } else if (pt > 30) { audit += "🧭 لم أجد إعدادات DNS (تخطّيت)"; nextPhase() }
-                        else progress("🔎 أبحث عن إعدادات DNS...")
+                        } else if (pt > 30) { audit += "🧭 لم أجد إعدادات DNS (تخطّيت)"; log("⏭ لم أجد إعدادات DNS"); nextPhase() }
+                        else log("🔎 أبحث عن إعدادات DNS...")
                     }
                     "clients" -> {
                         if (found) {
                             devices = r.optString("info").toIntOrNull() ?: -1
                             audit += if (devices > 8) "👥 الأجهزة المتصلة: $devices ⚠ عدد كبير قد يبطّئ الشبكة" else "👥 الأجهزة المتصلة: $devices"
+                            log("👥 الأجهزة المتصلة: $devices")
                             nextPhase()
                         } else if (pt > 12) { audit += "👥 تعذّر قراءة الأجهزة المتصلة"; nextPhase() }
-                        else progress("🔎 أقرأ الأجهزة المتصلة...")
+                        else log("🔎 أقرأ الأجهزة المتصلة...")
                     }
                     "chan" -> {
                         if (found) {
@@ -567,24 +908,31 @@ class MainActivity : Activity() {
                             if (r.optBoolean("changed")) {
                                 changed = true; wait = 5000
                                 if (!restoring) sp.edit().putInt("bk_ch", cn.coerceAtLeast(0)).putString("bk_wd", wd).apply()
-                                if (cn != bestCh) report += "📡 القناة: كانت ${if (cn <= 0) "تلقائي" else cn.toString()} ← أصبحت ${if (bestCh == 0) "تلقائي" else bestCh.toString()}"
-                                if (r.optBoolean("w")) report += "📶 عرض القناة ← ${if (restoring) restoreWid else "20MHz (أقل تداخلاً)"}"
-                            } else audit += "📡 القناة والعرض مناسبان (بدون تغيير)"
+                                if (cn != bestCh) {
+                                    val m = "📡 القناة: كانت ${if (cn <= 0) "تلقائي" else cn.toString()} ← أصبحت ${if (bestCh == 0) "تلقائي" else bestCh.toString()}"
+                                    report += m; log(m)
+                                }
+                                if (r.optBoolean("w")) { val m = "📶 عرض القناة ← ${if (restoring) restoreWid else "20MHz (أقل تداخلاً)"}"; report += m; log(m) }
+                            } else { audit += "📡 القناة والعرض مناسبان (بدون تغيير)"; log("📡 القناة والعرض مناسبان") }
                             nextPhase()
-                        } else if (pt > 30) { audit += "📡 لم أجد إعدادات القناة (تخطّيت)"; nextPhase() }
-                        else progress("🔎 أبحث عن إعدادات القناة...")
+                        } else if (pt > 30) { audit += "📡 لم أجد إعدادات القناة (تخطّيت)"; log("⏭ لم أجد إعدادات القناة"); nextPhase() }
+                        else log("🔎 أبحث عن إعدادات القناة...")
                     }
                     "reboot" -> {
                         if (r.optBoolean("clicked")) {
                             stop = true
-                            report += if (changed) "🔄 إعادة تشغيل الراوتر لتطبيق التغييرات"
+                            val m = if (changed) "🔄 إعادة تشغيل الراوتر لتطبيق التغييرات"
                                 else if (oldUptime) "🔄 إعادة تشغيل الراوتر (يعمل منذ مدة طويلة)"
                                 else "🔄 إعادة تشغيل الراوتر لأن السرعة منخفضة (تنظيف الاتصال)"
-                            rebooting()
+                            if (!report.contains(m)) report += m
+                            rebooting(false)
                         } else if (pt > 30) {
                             stop = true
-                            finish("⚠ لم أجد زر إعادة التشغيل، أعد تشغيل الراوتر يدوياً")
-                        } else progress("🔁 أنتقل لصفحة إعادة التشغيل...")
+                            rebooting(true)
+                        } else {
+                            if (pt == 12) log("🧩 العناصر الظاهرة: ${r.optString("dbg").take(350)}")
+                            log("🔁 أبحث عن زر إعادة التشغيل...")
+                        }
                     }
                 }
                 if (phase == "done") { stop = true; finish("✅ إعدادات السرعة سليمة، لا حاجة لإعادة التشغيل") }
@@ -593,27 +941,46 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun rebooting() {
-        val gw = ip.text.toString().trim()
-        progress("🔄 جاري إعادة تشغيل الراوتر... (حوالي دقيقة ونصف)")
+    // مراقبة إعادة التشغيل: ضغط تلقائي + تأكيد + إعادة محاولة + وضع المراقبة اليدوية
+    private fun rebooting(manualMode: Boolean) {
+        val gw = gwIp
+        log(if (manualMode) "🖐 اضغط Reboot بنفسك في صفحة الراوتر (كبّرها بإصبعين)، وأنا أراقب وأكمل تلقائياً" else "🔄 تم الضغط على Reboot، أنتظر انقطاع الراوتر...")
         thread {
             var down = false
             var i = 0
-            while (!down && i < 15) { Thread.sleep(3000); if (tcp(gw, 80) < 0) down = true; i++ }
+            val limit = if (manualMode) 40 else 12
+            while (!down && i < limit) {
+                Thread.sleep(3000)
+                if (!manualMode && i < 4) runOnUiThread { web.evaluateJavascript(confirmJs, null) }
+                if (tcp(gw, 80) < 0) down = true
+                i++
+            }
             if (!down) {
-                lastReport = (audit + report).joinToString("\n") + "\n\n⚠ لم أتأكد أن الراوتر أعاد التشغيل (لم ينقطع). أعد تشغيله يدوياً." + manual()
-                say(lastReport); endRun()
+                if (!manualMode && rebootTry < 2) {
+                    rebootTry++
+                    log("⚠ الراوتر لم ينقطع، أعيد المحاولة ($rebootTry/2)")
+                    runOnUiThread { moveTo("reboot"); ui.postDelayed({ step() }, 800) }
+                    return@thread
+                }
+                if (!manualMode) { runOnUiThread { rebooting(true) }; return@thread }
+                setStep(6, 3)
+                lastReport = (audit + report).joinToString("\n") + "\n\n⚠ لم أتأكد أن الراوتر أعاد التشغيل. أعد تشغيله يدوياً." + manual()
+                setReport(lastReport); setChip("● يحتاج تدخل", cAmber); endRun()
                 return@thread
             }
+            log("📴 الراوتر انقطع، أنتظر رجوعه...")
             var up = false
             var n = 0
             while (!up && n < 45) { if (tcp(gw, 80) >= 0) up = true else { Thread.sleep(4000); n++ } }
             if (!up) {
+                setStep(6, 3)
                 lastReport = (audit + report).joinToString("\n") + "\n\n⚠ الراوتر لم يرجع بعد. أعد توصيل الواي فاي ثم افحص من جديد."
-                say(lastReport); endRun()
+                setReport(lastReport); setChip("● يحتاج تدخل", cAmber); endRun()
                 return@thread
             }
-            say("✅ الراوتر رجع. جاري قياس السرعة بعد الإصلاح...")
+            setStep(6, 2)
+            setStep(7, 1)
+            log("✅ الراوتر رجع. أقيس السرعة بعد الإصلاح...")
             Thread.sleep(15000)
             val (after, _) = speedRetry()
             showFinal("✅ تمت إعادة تشغيل الراوتر فعلياً (انقطع ثم رجع)", after)
@@ -622,11 +989,13 @@ class MainActivity : Activity() {
 
     private fun endRun() {
         running = false; restoring = false
-        runOnUiThread { restoreBtn.isEnabled = hasBackup() }
+        runOnUiThread { restoreBtn.isEnabled = hasBackup(); startBtn.isEnabled = true }
     }
 
     private fun finish(msg: String) {
-        progress("$msg\n🚪 جاري تسجيل الخروج من صفحة الراوتر...")
+        log(msg)
+        setStep(7, 1)
+        log("🚪 جاري تسجيل الخروج من صفحة الراوتر...")
         web.evaluateJavascript(logoutJs, null)
         ui.postDelayed({
             CookieManager.getInstance().removeAllCookies(null)
@@ -639,7 +1008,6 @@ class MainActivity : Activity() {
         }, 4000)
     }
 
-    // خطوات يدوية تُعرض تلقائياً لو واجهة الراوتر لم تُفهم آلياً
     private fun manual(): String {
         if (restoring) return ""
         val s = mutableListOf<String>()
@@ -670,7 +1038,19 @@ class MainActivity : Activity() {
         sb.append(manual())
         if (hasBackup()) sb.append("\n\n↩ تقدر ترجّع إعدادات الراوتر السابقة بزر «استرجاع».")
         lastReport = sb.toString()
-        say(lastReport)
+
+        runOnUiThread {
+            afterTv.text = mb(after)
+            if (beforeSpeed > 0 && after > 0) {
+                val pct = (after - beforeSpeed) / beforeSpeed * 100
+                gainTv.text = (if (pct >= 0) "+" else "") + "%.0f%%".format(pct)
+                gainTv.setTextColor(if (pct >= 0) cGreen else cRed)
+            }
+        }
+        setStep(7, 2)
+        setReport(lastReport)
+        setChip("● اكتمل", cGreen)
+        log("🏁 انتهى. التقرير الكامل في الأعلى")
         endRun()
     }
 }
