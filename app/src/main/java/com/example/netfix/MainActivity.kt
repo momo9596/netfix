@@ -31,6 +31,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
@@ -140,6 +141,17 @@ class MainActivity : Activity() {
     private lateinit var resultPct: TextView
     private lateinit var resultBarV: ProgressBar
     private lateinit var resultSub: TextView
+    private lateinit var verdictTv: TextView
+    private lateinit var wizard: ScrollView
+    private lateinit var wizP1: LinearLayout
+    private lateinit var wizP2: LinearLayout
+    private lateinit var wizIp: EditText
+    private lateinit var wizUser: EditText
+    private lateinit var wizPass: EditText
+    private lateinit var wizErr: TextView
+    private var connecting = false
+    private var connTicks = 0
+    private var ipFails = 0
     private var primary = ""
     private var diagText = ""
     private var lastReport = ""
@@ -233,6 +245,7 @@ class MainActivity : Activity() {
         requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION), 1)
         window.statusBarColor = cBg
         window.navigationBarColor = cBg
+        window.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; setBackgroundColor(cBg)
@@ -268,14 +281,15 @@ class MainActivity : Activity() {
             layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) }
         }
         inCard.addView(autoSw)
+        inCard.visibility = View.GONE
         dash.addView(inCard)
 
         // الأزرار
-        startBtn = gradBtn("🚀 ابدأ الفحص والإصلاح", cCyan, cBlue)
+        startBtn = gradBtn("🔄 إعادة الفحص والتحسين", cCyan, cBlue)
         startBtn.setOnClickListener {
-            if (running || diagBusy) return@setOnClickListener
+            if (running || diagBusy || connecting) return@setOnClickListener
             startBtn.isEnabled = false
-            openRouter(); diagnose(true)
+            connectRouter()
         }
         dash.addView(startBtn)
         val row = LinearLayout(this).apply {
@@ -285,11 +299,16 @@ class MainActivity : Activity() {
         fixBtn = smallBtn("🔁 إعادة المحاولة").apply { isEnabled = false; setOnClickListener { openRouter(); applyFixes() } }
         restoreBtn = smallBtn("↩ استرجاع").apply { isEnabled = hasBackup(); setOnClickListener { restoreBackup() } }
         val copyBtn = smallBtn("📋 نسخ التقرير").apply { setOnClickListener { copyReport() } }
-        row.addView(fixBtn); row.addView(restoreBtn); row.addView(copyBtn)
+        val settingsBtn = smallBtn("⚙ بيانات الراوتر").apply {
+            setOnClickListener { if (!running && !diagBusy && !connecting) showWizard(1, "") }
+        }
+        row.addView(fixBtn); row.addView(restoreBtn); row.addView(copyBtn); row.addView(settingsBtn)
         dash.addView(row)
 
         resultCard = cardBox().apply { visibility = View.GONE }
-        resultCard.addView(label("🏆 نسبة نجاح الاختبار", 13f, cMuted))
+        resultCard.addView(label("🏆 نتيجة التحسين ونسبة نجاح الاختبار", 13f, cMuted))
+        verdictTv = label("", 17f, cText, true).apply { gravity = Gravity.CENTER; setPadding(0, dp(8), 0, 0) }
+        resultCard.addView(verdictTv)
         resultPct = label("0%", 46f, cGreen, true).apply { gravity = Gravity.CENTER; setPadding(0, dp(6), 0, 0) }
         resultCard.addView(resultPct)
         resultBarV = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
@@ -410,15 +429,154 @@ class MainActivity : Activity() {
         webPanel.addView(web)
 
         root.addView(dashScroll); root.addView(webPanel)
-        setContentView(root)
-        if (autoSw.isChecked) {
-            log("⚡ سيبدأ الفحص والإصلاح تلقائياً خلال 4 ثوانٍ (ألغِ المفتاح لإيقاف ذلك)")
-            ui.postDelayed({
-                if (!autoSw.isChecked || running || diagBusy) return@postDelayed
-                if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) startBtn.performClick()
-                else log("📍 امنح صلاحية الموقع ثم اضغط «ابدأ»")
-            }, 4000)
+        val frame = FrameLayout(this)
+        frame.addView(root, FrameLayout.LayoutParams(-1, -1))
+        buildWizard()
+        frame.addView(wizard, FrameLayout.LayoutParams(-1, -1))
+        setContentView(frame)
+        showWizard(1, "")
+    }
+
+    // ================= شاشات البداية: IP ← بيانات الدخول ← تشغيل تلقائي =================
+    private fun buildWizard() {
+        val prefs = getSharedPreferences("nf", 0)
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(24), dp(56), dp(24), dp(24))
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
         }
+        col.addView(label("📡", 56f).apply { gravity = Gravity.CENTER })
+        col.addView(label("NetFix Pro", 28f, cText, true).apply { gravity = Gravity.CENTER })
+        col.addView(label("تحسين سرعة واستقرار الإنترنت تلقائياً", 13f, cMuted).apply { gravity = Gravity.CENTER; setPadding(0, 0, 0, dp(24)) })
+
+        wizP1 = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        wizP1.addView(label("الخطوة 1 من 2 — عنوان الراوتر", 15f, cCyan, true))
+        wizP1.addView(label("اكتب IP الراوتر (غالباً مكتوب خلف الراوتر مثل 192.168.1.1). ملأت عنوان شبكتك الحالية تلقائياً.", 12f, cMuted).apply { setPadding(0, dp(6), 0, 0) })
+        wizIp = field("عنوان الراوتر").apply {
+            setText(prefs.getString("router_ip", null) ?: gateway())
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+        }
+        wizP1.addView(wizIp)
+        val next1 = gradBtn("التالي ←", cCyan, cBlue)
+        next1.setOnClickListener { onIpNext() }
+        wizP1.addView(next1)
+
+        wizP2 = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; visibility = View.GONE }
+        wizP2.addView(label("الخطوة 2 من 2 — دخول الراوتر", 15f, cCyan, true))
+        wizP2.addView(label("اكتب اسم المستخدم وكلمة المرور (غالباً admin أو مكتوبة خلف الراوتر). لو الراوتر بلا كلمة مرور اترك الخانة فارغة. كلمة المرور لا تُحفظ.", 12f, cMuted).apply { setPadding(0, dp(6), 0, 0) })
+        wizUser = field("اسم المستخدم").apply { setText(prefs.getString("router_user", "admin")) }
+        wizPass = field("كلمة المرور", true)
+        wizP2.addView(wizUser); wizP2.addView(wizPass)
+        val go = gradBtn("🚀 دخول وبدء التحسين التلقائي", cGreen, cCyan)
+        go.setOnClickListener { onGoClicked() }
+        wizP2.addView(go)
+        val back = toolChip("→ رجوع").apply {
+            layoutParams = LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(14) }
+            setOnClickListener { showWizard(1, "") }
+        }
+        wizP2.addView(back)
+
+        wizErr = label("", 13f, cRed).apply { gravity = Gravity.CENTER; setPadding(0, dp(14), 0, 0) }
+        col.addView(wizP1); col.addView(wizP2); col.addView(wizErr)
+        wizard = ScrollView(this).apply { setBackgroundColor(cBg); isFillViewport = true; addView(col) }
+    }
+
+    private fun showWizard(page: Int, msg: String) {
+        runOnUiThread {
+            wizP1.visibility = if (page == 1) View.VISIBLE else View.GONE
+            wizP2.visibility = if (page == 2) View.VISIBLE else View.GONE
+            wizErr.text = msg
+            wizard.animate().cancel()
+            wizard.alpha = 1f; wizard.visibility = View.VISIBLE
+        }
+    }
+
+    override fun onBackPressed() {
+        if (wizard.visibility == View.VISIBLE && wizP2.visibility == View.VISIBLE) showWizard(1, "") else super.onBackPressed()
+    }
+
+    private fun onIpNext() {
+        val v = wizIp.text.toString().trim()
+        if (!Regex("[A-Za-z0-9.-]+").matches(v) || !v.contains(".")) { wizErr.text = "اكتب عنواناً صحيحاً مثل 192.168.1.1"; return }
+        wizErr.text = "⏳ أتحقق من الاتصال بالراوتر..."
+        thread {
+            bindToWifi()
+            val ok = routerUp(v)
+            runOnUiThread {
+                if (ok) {
+                    ipFails = 0
+                    getSharedPreferences("nf", 0).edit().putString("router_ip", v).apply()
+                    showWizard(2, "")
+                } else {
+                    ipFails++
+                    if (ipFails >= 2) {
+                        getSharedPreferences("nf", 0).edit().putString("router_ip", v).apply()
+                        showWizard(2, "⚠ لم أتحقق من الاتصال بالعنوان، لكن سأجرّب الدخول")
+                    } else {
+                        wizErr.text = "❌ لا أستطيع الوصول لهذا العنوان. تأكد أنك متصل بواي فاي الراوتر وأن الـ IP صحيح (اضغط التالي مرة أخرى للمتابعة رغم ذلك)."
+                    }
+                }
+            }
+        }
+    }
+
+    private fun onGoClicked() {
+        val u = wizUser.text.toString().trim()
+        val pw = wizPass.text.toString()
+        val v = wizIp.text.toString().trim()
+        ip.setText(v); userEt.setText(u); passEt.setText(pw)
+        getSharedPreferences("nf", 0).edit().putString("router_ip", v).putString("router_user", u).apply()
+        wizErr.text = ""
+        wizard.animate().alpha(0f).setDuration(350).withEndAction { wizard.visibility = View.GONE }.start()
+        connectRouter()
+    }
+
+    // ================= الدخول للراوتر ثم البدء التلقائي بمجرد ظهور الإعدادات =================
+    private fun connectRouter() {
+        if (connecting) return
+        connecting = true; connTicks = 0; loginTries = 0; pt = 0
+        gwIp = ip.text.toString().trim()
+        bindToWifi()
+        resetUi()
+        setChip("● جارٍ الدخول", cAmber)
+        setStep(3, 1)
+        log("🔌 أفتح صفحة الراوتر $gwIp وأسجّل الدخول...")
+        runOnUiThread { startBtn.isEnabled = false }
+        openRouter()
+        ui.postDelayed({ connectStep() }, 3000)
+    }
+
+    private fun connectStep() {
+        connTicks++
+        if (connTicks > 60) { loginFailed("لم تظهر إعدادات الراوتر خلال وقت معقول. تأكد من العنوان وبيانات الدخول."); return }
+        web.evaluateJavascript(js("status")) { raw ->
+            val r = try { JSONObject(raw ?: "") } catch (e: Exception) { null }
+            if (r != null && r.optBoolean("pw")) {
+                loginTries++
+                if (loginTries >= 5) { loginFailed("تعذّر تسجيل الدخول. تأكد من اسم المستخدم وكلمة المرور."); return@evaluateJavascript }
+                log(if (passEt.text.isNotEmpty() && loginTries <= 2) "🔐 أسجّل الدخول تلقائياً..." else "⏳ أنتظر نتيجة تسجيل الدخول... ($loginTries)")
+            } else if (r != null && r.optBoolean("found")) {
+                connecting = false
+                loginTries = 0
+                log("✅ ظهرت إعدادات الراوتر — أبدأ الفحص والتحسين تلقائياً")
+                setStep(3, 2)
+                diagnose(true)
+                return@evaluateJavascript
+            } else if (r != null) {
+                pt++
+                log("🔎 أبحث عن صفحة الإعدادات...")
+            }
+            ui.postDelayed({ connectStep() }, 2500)
+        }
+    }
+
+    private fun loginFailed(msg: String) {
+        connecting = false
+        setStep(3, 3)
+        setChip("● تعذّر الدخول", cRed)
+        log("❌ $msg")
+        runOnUiThread { startBtn.isEnabled = true }
+        showWizard(2, "❌ $msg")
     }
 
     // ================= السجل والحالة =================
@@ -582,44 +740,34 @@ class MainActivity : Activity() {
     }
 
     private fun benchmarkDns(): List<Pair<String, Double>> {
-        // نقيس المرشحين العشرة فقط حتى تكون القائمة المعروضة عشرة خوادم بالضبط.
+        val all = (ispDns() + dnsCandidates).distinct()
         val results = java.util.Collections.synchronizedList(mutableListOf<Pair<String, Double>>())
-        val ts = dnsCandidates.distinct().map { server ->
-            thread(name = "dns-${server.replace('.', '-')}") {
-                results.add(server to dnsScore(server))
-            }
-        }
-        ts.forEach { it.join(35000) }
-        return ArrayList(results)
-            .filter { it.second < 1400.0 }
-            .sortedBy { it.second }
-            .take(10)
+        val ts = all.map { s -> thread { results.add(s to dnsScore(s)) } }
+        ts.forEach { it.join(30000) }
+        return ArrayList(results).filter { it.second < 1400 }.sortedBy { it.second }
     }
 
     private fun chooseDns(ranked: List<Pair<String, Double>>) {
-        if (ranked.isEmpty()) {
-            dnsWorth = false
-            dnsReport = "🧭 تعذّر قياس خوادم DNS العشرة؛ لن أغيّر إعداد DNS تلقائياً."
-            return
-        }
+        if (ranked.isEmpty()) { dnsWorth = false; dnsReport = "🧭 تعذّر قياس DNS"; return }
         val cur = ispDns().firstOrNull()
-        val curScore = if (cur == null) null else {
-            ranked.firstOrNull { it.first == cur }?.second ?: run {
-                val measured = dnsScore(cur)
-                if (measured < 1400.0) measured else null
-            }
-        }
-        val best = ranked.first()
+        val curScore = ranked.firstOrNull { it.first == cur }?.second
+        val best = ranked[0]
         bestDns = best.first
-        bestDns2 = ranked.getOrNull(1)?.first ?: best.first
-        dnsWorth = curScore == null || best.second < curScore * 0.90
-        if (!dnsWorth && cur != null) bestDns = cur
-        dnsReport = "🧭 أسرع DNS مقاس: ${best.first} (${best.second.toInt()}ms)" +
-            (if (curScore != null) " | الحالي $cur (${curScore.toInt()}ms)" else " | تعذّر قياس الحالي") +
-            if (dnsWorth) " ← مرشح للتطبيق" else " ← الحالي قريب من الأفضل؛ لا تغيير"
+        bestDns2 = ranked.getOrNull(1)?.first ?: "8.8.8.8"
+        dnsWorth = curScore == null || best.second < curScore * 0.9
+        if (!dnsWorth) bestDns = cur ?: best.first
+        dnsReport = "🧭 أفضل DNS: ${best.first} (${best.second.toInt()}ms)" +
+            (if (curScore != null) " | الحالي $cur (${curScore.toInt()}ms)" else "") +
+            if (dnsWorth) " ← سيتغيّر" else " ← الحالي مناسب"
     }
 
-    private fun pickChannel(wm: WifiManager, curCh: Int): ChanScan {
+    private fun pickChannel(wm: WifiManager, curCh: Int): ChanScan = try {
+        pickChannelRaw(wm, curCh)
+    } catch (e: Exception) {
+        log("⚠ تعذّر مسح القنوات (فعّل الموقع وامنح الصلاحية)"); ChanScan(6, 0, false)
+    }
+
+    private fun pickChannelRaw(wm: WifiManager, curCh: Int): ChanScan {
         val own = wm.connectionInfo.bssid
         val seen = HashMap<String, Int>()
         val freq = HashMap<String, Int>()
@@ -644,46 +792,17 @@ class MainActivity : Activity() {
         return Pair(if (ok.isEmpty()) -1.0 else ok.average(), (n - ok.size) * 100 / n)
     }
 
-    private fun icmpPing(host: String): Long {
-        return try {
-            val start = System.nanoTime()
-            val process = ProcessBuilder("ping", "-c", "1", "-W", "2", host)
-                .redirectErrorStream(true)
-                .start()
-            val output = process.inputStream.bufferedReader().use { it.readText() }
-            val finished = process.waitFor()
-            if (finished != 0) return -1L
-
-            val reported = Regex("time[=<]([0-9.]+)\\s*ms", RegexOption.IGNORE_CASE)
-                .find(output)?.groupValues?.getOrNull(1)?.toDoubleOrNull()
-            if (reported != null) reported.toLong()
-            else ((System.nanoTime() - start) / 1_000_000L).coerceAtLeast(1L)
-        } catch (_: Exception) {
-            -1L
-        }
-    }
-
     private fun pingStats(n: Int): Triple<Double, Double, Int> {
-        val samples = mutableListOf<Long>()
-        var usedIcmp = true
+        val t = mutableListOf<Long>()
         for (i in 1..n) {
-            var x = icmpPing("1.1.1.1")
-            if (x < 0) {
-                usedIcmp = false
-                // Fallback: DNS response time, not an ICMP ping measurement.
-                x = dnsUdp("1.1.1.1")
-            }
-            if (x >= 0) samples.add(x)
-            Thread.sleep(120)
+            val x = dnsUdp("1.1.1.1")
+            if (x >= 0) t.add(x)
+            Thread.sleep(100)
         }
-        val avg = if (samples.isEmpty()) -1.0 else samples.average()
-        var jitter = 0.0
-        for (i in 1 until samples.size) {
-            jitter += kotlin.math.abs(samples[i] - samples[i - 1]).toDouble()
-        }
-        val loss = ((n - samples.size) * 100 / n)
-        if (!usedIcmp) log("ℹ تعذّر ICMP على هذا الجهاز؛ تم استخدام زمن استجابة DNS كقياس بديل وليس Ping حقيقياً.")
-        return Triple(avg, if (samples.size > 1) jitter / (samples.size - 1) else 0.0, loss)
+        val avg = if (t.isEmpty()) -1.0 else t.average()
+        var j = 0.0
+        for (i in 1 until t.size) j += Math.abs(t[i] - t[i - 1]).toDouble()
+        return Triple(avg, if (t.size > 1) j / (t.size - 1) else 0.0, (n - t.size) * 100 / n)
     }
 
     private fun speedLoaded(): Pair<Double, Double> {
@@ -1115,29 +1234,16 @@ class MainActivity : Activity() {
     }
 
     private fun awaitInternet() {
-        // لا نبدأ فحص السرعة لمجرد عودة صفحة الراوتر؛ ننتظر عودة الإنترنت أيضاً.
-        val started = System.currentTimeMillis()
-        var lastMessage = 0L
-        var internetBack = false
-        while (System.currentTimeMillis() - started < 120_000L) {
+        val t0 = System.currentTimeMillis()
+        var n = 0
+        while (System.currentTimeMillis() - t0 < 90_000L) {
             bindToWifi()
-            val ok = dnsUdp("1.1.1.1") >= 0 || dnsUdp("8.8.8.8") >= 0
-            if (ok) {
-                internetBack = true
-                log("🌐 عاد الإنترنت بعد إعادة التشغيل")
-                break
-            }
-            val elapsed = (System.currentTimeMillis() - started) / 1000L
-            if (elapsed - lastMessage >= 12L) {
-                lastMessage = elapsed
-                log("⏳ الراوتر متصل؛ أنتظر عودة الإنترنت قبل فحص الجودة (${elapsed}ث)")
-            }
-            Thread.sleep(2500)
+            if (dnsUdp("1.1.1.1") >= 0 || dnsUdp("8.8.8.8") >= 0) { log("🌐 الإنترنت رجع"); break }
+            if (n % 4 == 0) log("⏳ أنتظر عودة الإنترنت بعد إعادة التشغيل...")
+            n++
+            Thread.sleep(3000)
         }
-        if (!internetBack) {
-            log("⚠ انتهت مهلة انتظار الإنترنت؛ سأجري القياسات المتاحة وأوضح أي قياس فشل.")
-        }
-        Thread.sleep(2500)
+        Thread.sleep(4000)
     }
 
     // ================= مراقبة إعادة التشغيل (لا تتوقف أبداً: تكمل للفحص والنتيجة دائماً) =================
@@ -1237,26 +1343,15 @@ class MainActivity : Activity() {
     private fun doLogout() {
         val latch = java.util.concurrent.CountDownLatch(1)
         runOnUiThread {
-            try {
-                web.evaluateJavascript(logoutJs, null)
-                ui.postDelayed({
-                    try {
-                        CookieManager.getInstance().removeAllCookies(null)
-                        web.clearCache(true)
-                        web.loadUrl("about:blank")
-                        loggedOut = true
-                    } catch (_: Exception) {
-                        loggedOut = false
-                    } finally {
-                        latch.countDown()
-                    }
-                }, 1800)
-            } catch (_: Exception) {
-                loggedOut = false
+            web.evaluateJavascript(logoutJs, null)
+            ui.postDelayed({
+                CookieManager.getInstance().removeAllCookies(null)
+                web.clearCache(true); web.loadUrl("about:blank")
                 latch.countDown()
-            }
+            }, 2000)
         }
         latch.await(6, java.util.concurrent.TimeUnit.SECONDS)
+        loggedOut = true
     }
 
     private fun endRun() {
@@ -1281,7 +1376,7 @@ class MainActivity : Activity() {
     // ================= ترتيب الـ DNS ونسبة النجاح =================
     private fun dnsRankText(): String {
         if (dnsRank.isEmpty()) return "لم يتم القياس"
-        return dnsRank.take(10).mapIndexed { i, p ->
+        return dnsRank.take(11).mapIndexed { i, p ->
             val name = (dnsNames[p.first] ?: "DNS المزوّد") + (if (p.first == curDnsAtStart) " (الحالي)" else "")
             val mark = if (p.first == bestDns) " ⭐" else if (p.first == bestDns2) " ✔" else ""
             "${i + 1}. $name ${p.first} — ${p.second.toInt()}ms$mark"
@@ -1306,6 +1401,31 @@ class MainActivity : Activity() {
 
     private fun ms(x: Double) = if (x < 0) "—" else "${x.toInt()}ms"
 
+    // عنوان النتيجة + تفاصيل المقارنة + لون
+    private fun improvementSummary(after: Double, pa: Triple<Double, Double, Int>): Triple<String, String, Int> {
+        val lines = mutableListOf<String>()
+        var head = "⚠ تعذّر مقارنة السرعة"
+        var col = cMuted
+        if (beforeSpeed > 0 && after > 0) {
+            val g = (after - beforeSpeed) / beforeSpeed * 100
+            val gi = Math.abs(g).toInt()
+            if (g >= 10) { head = "🎉 تحسّنت السرعة بنسبة +$gi%"; col = cGreen; lines += "✅ السرعة: ${fmt(beforeSpeed)} ← ${fmt(after)} (+$gi%)" }
+            else if (g <= -10) { head = "⚠ السرعة انخفضت $gi%"; col = cRed; lines += "⚠ السرعة: ${fmt(beforeSpeed)} ← ${fmt(after)} (-$gi%) — قد يكون تقلّباً مؤقتاً أو الخط نفسه" }
+            else { head = "➖ السرعة شبه ثابتة"; col = cAmber; lines += "➖ السرعة: ${fmt(beforeSpeed)} ← ${fmt(after)} (${if (g >= 0) "+" else "-"}$gi%)" }
+        } else lines += "⚠ تعذّر قياس السرعة في أحد الاختبارين"
+        if (pingB.first > 0 && pa.first > 0) {
+            val pg = (pingB.first - pa.first) / pingB.first * 100
+            val pi = Math.abs(pg).toInt()
+            lines += if (pg >= 10) "✅ زمن الاستجابة (Ping) تحسّن $pi%" else if (pg <= -10) "⚠ زمن الاستجابة ارتفع $pi%" else "➖ الـ Ping شبه ثابت (${pa.first.toInt()}ms)"
+        }
+        val jb = pingB.second; val ja = pa.second
+        lines += if (ja < jb - 1) "✅ استقرار الاتصال تحسّن (تذبذب ${jb.toInt()}ms ← ${ja.toInt()}ms)"
+            else if (ja > jb + 1) "⚠ التذبذب زاد (${jb.toInt()}ms ← ${ja.toInt()}ms)"
+            else "➖ التذبذب ثابت (${ja.toInt()}ms)"
+        lines += "📈 كفاءة الشبكة: $scoreB% ← $scoreA%"
+        return Triple(head, lines.joinToString("\n"), col)
+    }
+
     private fun advice(after: Double, pa: Triple<Double, Double, Int>): String {
         val tips = mutableListOf<String>()
         if (after in 0.0..5.0) tips += "⚠ السرعة ما زالت منخفضة بعد الضبط: السبب خارج الراوتر (خط الشركة أو الباقة). انسخ التقرير وأرسله للشركة."
@@ -1321,9 +1441,10 @@ class MainActivity : Activity() {
         val sp = getSharedPreferences("nf", 0)
         val prev = sp.getFloat("last", -1f)
         val pct = if (restoring) -1 else successScore(after)
+        val imp = improvementSummary(after, pa)
         val sb = StringBuilder()
         sb.append(msg).append("\n\n")
-        if (pct >= 0) sb.append("🏆 نسبة نجاح الاختبار: $pct/100\n(اكتمال المهام $scTasks/100 • صحة الشبكة بعد $scoreA/100 • التحسّن $scImpr/100)\n\n")
+        if (pct >= 0) sb.append("🏆 نسبة نجاح الاختبار: $pct/100\n${imp.first}\n${imp.second}\n(اكتمال المهام $scTasks/100 • صحة الشبكة بعد $scoreA/100 • التحسّن $scImpr/100)\n\n")
         if (audit.isNotEmpty()) sb.append("🧪 فحص الراوتر:\n").append(audit.joinToString("\n")).append("\n\n")
         if (report.isNotEmpty()) sb.append("🛠 ما تم تنفيذه:\n").append(report.joinToString("\n")).append("\n\n")
         sb.append("🧭 ترتيب أسرع DNS:\n").append(dnsRankText()).append("\n\n")
@@ -1348,8 +1469,9 @@ class MainActivity : Activity() {
                 val col = if (pct >= 80) cGreen else if (pct >= 55) cAmber else cRed
                 resultPct.setTextColor(col)
                 resultBarV.progressTintList = ColorStateList.valueOf(col)
-                resultSub.text = "اكتمال المهام $scTasks/100  •  صحة الشبكة $scoreA/100  •  التحسّن $scImpr/100\n" +
-                    (if (pct >= 80) "نتيجة ممتازة 🟢" else if (pct >= 55) "نتيجة جيدة 🟡" else "تحتاج تدخلاً 🔴")
+                verdictTv.text = imp.first; verdictTv.setTextColor(imp.third)
+                resultSub.text = imp.second + "\n\nنسبة النجاح: " + (if (pct >= 80) "ممتازة 🟢" else if (pct >= 55) "جيدة 🟡" else "تحتاج تدخلاً 🔴") +
+                    "\nاكتمال المهام $scTasks/100  •  صحة الشبكة $scoreA/100  •  التحسّن $scImpr/100"
                 ValueAnimator.ofInt(0, pct).setDuration(1200).apply {
                     addUpdateListener { a -> val v = a.animatedValue as Int; resultPct.text = "$v%"; resultBarV.progress = v }
                 }.start()
