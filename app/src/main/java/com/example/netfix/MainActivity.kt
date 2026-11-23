@@ -2,6 +2,7 @@ package com.example.netfix
 
 import android.Manifest
 import android.animation.ObjectAnimator
+import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
@@ -13,6 +14,8 @@ import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.os.Handler
@@ -89,9 +92,9 @@ class MainActivity : Activity() {
     private val stepViews = mutableListOf<TextView>()
     private val stepNames = listOf(
         "فحص الشبكة والسرعة", "قياس أسرع DNS", "مسح القنوات", "الدخول لصفحة الراوتر",
-        "تطبيق DNS", "ضبط القناة والعرض", "إعادة تشغيل الراوتر", "قياس السرعة بعد الإصلاح"
+        "تطبيق DNS", "ضبط القناة والعرض", "إعادة تشغيل الراوتر", "قياس الجودة والـ Ping بعد الإصلاح", "تسجيل الخروج والنتيجة النهائية"
     )
-    private val stepState = IntArray(8)
+    private val stepState = IntArray(9)
     private var webFull = false
 
     // ---------- الحالة ----------
@@ -123,6 +126,20 @@ class MainActivity : Activity() {
     private var pingA: Triple<Double, Double, Int>? = null
     private var scoreB = 0
     private var scoreA = 0
+    private var rebootOk = false
+    private var rebootPlanned = false
+    private var loggedOut = false
+    private var gwBefore = -1.0
+    private var gwAfter = -1.0
+    private var dnsRank: List<Pair<String, Double>> = emptyList()
+    private var curDnsAtStart = ""
+    private var scTasks = 0
+    private var scImpr = 0
+    private lateinit var dnsTv: TextView
+    private lateinit var resultCard: LinearLayout
+    private lateinit var resultPct: TextView
+    private lateinit var resultBarV: ProgressBar
+    private lateinit var resultSub: TextView
     private var primary = ""
     private var diagText = ""
     private var lastReport = ""
@@ -133,9 +150,15 @@ class MainActivity : Activity() {
     private val order = listOf("status", "dns", "clients", "chan")
     private val ui = Handler(Looper.getMainLooper())
 
+    // 10 مزوّدين مختلفين (مرشّحون فقط)، والترتيب والاختيار بالقياس الحي
     private val dnsCandidates = listOf(
-        "1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4", "9.9.9.9", "149.112.112.112",
-        "208.67.222.222", "208.67.220.220", "94.140.14.14", "185.228.168.9"
+        "1.1.1.1", "8.8.8.8", "9.9.9.9", "208.67.222.222", "94.140.14.140",
+        "76.76.2.0", "64.6.64.6", "4.2.2.1", "84.200.69.80", "8.26.56.26"
+    )
+    private val dnsNames = mapOf(
+        "1.1.1.1" to "Cloudflare", "8.8.8.8" to "Google", "9.9.9.9" to "Quad9",
+        "208.67.222.222" to "OpenDNS", "94.140.14.140" to "AdGuard", "76.76.2.0" to "Control D",
+        "64.6.64.6" to "Verisign", "4.2.2.1" to "Level3", "84.200.69.80" to "DNS.WATCH", "8.26.56.26" to "Comodo"
     )
     private val testDomains = listOf(
         "google.com", "youtube.com", "facebook.com", "wikipedia.org",
@@ -265,6 +288,19 @@ class MainActivity : Activity() {
         row.addView(fixBtn); row.addView(restoreBtn); row.addView(copyBtn)
         dash.addView(row)
 
+        resultCard = cardBox().apply { visibility = View.GONE }
+        resultCard.addView(label("🏆 نسبة نجاح الاختبار", 13f, cMuted))
+        resultPct = label("0%", 46f, cGreen, true).apply { gravity = Gravity.CENTER; setPadding(0, dp(6), 0, 0) }
+        resultCard.addView(resultPct)
+        resultBarV = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100; progress = 0; progressTintList = ColorStateList.valueOf(cGreen)
+            layoutParams = LinearLayout.LayoutParams(-1, dp(10)).apply { topMargin = dp(6) }
+        }
+        resultCard.addView(resultBarV)
+        resultSub = label("", 13f, cText).apply { gravity = Gravity.CENTER; setPadding(0, dp(8), 0, 0) }
+        resultCard.addView(resultSub)
+        dash.addView(resultCard)
+
         // مراحل العمل
         val stepsCard = cardBox()
         stepsCard.addView(label("📋 مراحل العمل", 13f, cMuted))
@@ -300,6 +336,12 @@ class MainActivity : Activity() {
         pingTv = label("بعد الفحص تظهر هنا نتائج الاستجابة والتذبذب وفقد الحزم قبل وبعد الإصلاح", 13f, cText).apply { setPadding(0, dp(8), 0, 0) }
         pgCard.addView(pingTv)
         dash.addView(pgCard)
+
+        val dnsCard = cardBox()
+        dnsCard.addView(label("🧭 ترتيب أسرع DNS (قياس حي)", 13f, cMuted))
+        dnsTv = label("سيظهر ترتيب أسرع 10 DNS بعد القياس", 12f, cText).apply { typeface = Typeface.MONOSPACE; setPadding(0, dp(8), 0, 0) }
+        dnsCard.addView(dnsTv)
+        dash.addView(dnsCard)
 
         // السجل المباشر
         val logCard = cardBox()
@@ -413,6 +455,8 @@ class MainActivity : Activity() {
         runOnUiThread {
             beforeTv.text = "—"; afterTv.text = "—"; gainTv.text = "—"; gainTv.setTextColor(cMuted)
             pingTv.text = "جارٍ القياس..."
+            dnsTv.text = "جارٍ القياس..."
+            resultCard.visibility = View.GONE
             reportCard.visibility = View.GONE
         }
     }
@@ -552,7 +596,7 @@ class MainActivity : Activity() {
         val best = ranked[0]
         bestDns = best.first
         bestDns2 = ranked.getOrNull(1)?.first ?: "8.8.8.8"
-        dnsWorth = curScore == null || best.second < curScore * 0.8
+        dnsWorth = curScore == null || best.second < curScore * 0.9
         if (!dnsWorth) bestDns = cur ?: best.first
         dnsReport = "🧭 أفضل DNS: ${best.first} (${best.second.toInt()}ms)" +
             (if (curScore != null) " | الحالي $cur (${curScore.toInt()}ms)" else "") +
@@ -661,13 +705,14 @@ class MainActivity : Activity() {
         val gw = gwIp
         thread {
             try {
+                bindToWifi()
                 val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
                 val info = wm.connectionInfo
                 val is24 = info.frequency in 2400..2500
                 val curCh = if (is24) (info.frequency - 2407) / 5 else (info.frequency - 5000) / 5
 
                 setStep(0, 1)
-                say("⏳ فحص الاتصال بالراوتر..."); val (gwMs, gwLoss) = stats({ tcp(gw, 80) })
+                say("⏳ فحص الاتصال بالراوتر..."); val (gwMs, gwLoss) = stats({ tcp(gw, 80) }); gwBefore = gwMs
                 say("⏳ فحص استقرار الإنترنت (20 قياساً)..."); val (netMs, jitter, netLoss) = pingStats(20)
                 say("⏳ اختبار السرعة (قد يستغرق دقيقة)..."); val (sp, loaded) = speedRetry(); beforeSpeed = sp
                 runOnUiThread { beforeTv.text = mb(sp) }
@@ -682,7 +727,9 @@ class MainActivity : Activity() {
                 setStep(1, 1)
                 say("⏳ قياس أسرع DNS فعلياً (8 مواقع × كل سيرفر)...")
                 val ranked = benchmarkDns()
+                dnsRank = ranked; curDnsAtStart = ispDns().firstOrNull() ?: ""
                 chooseDns(ranked)
+                renderDns()
                 say(dnsReport)
                 setStep(1, 2)
 
@@ -874,6 +921,7 @@ class MainActivity : Activity() {
         if (running) return
         running = true; phase = "status"; ticks = 0; pt = 0; changed = false; oldUptime = false; devices = -1
         dnsDone = false; chanDone = false; loginTries = 0; rebootTry = 0
+        rebootOk = false; rebootPlanned = false; loggedOut = false
         gwIp = ip.text.toString().trim()
         report.clear(); audit.clear()
         setChip("● جارٍ العمل", cAmber)
@@ -889,7 +937,7 @@ class MainActivity : Activity() {
             "dns" -> { setStep(3, 2); setStep(4, 1) }
             "clients" -> setStep(4, if (dnsDone) 2 else 3)
             "chan" -> setStep(5, 1)
-            "reboot" -> { setStep(5, if (chanDone) 2 else 3); setStep(6, 1) }
+            "reboot" -> { rebootPlanned = true; setStep(5, if (chanDone) 2 else 3); setStep(6, 1) }
             "done" -> { setStep(5, if (chanDone) 2 else 3); setStep(6, 3) }
         }
     }
@@ -1003,50 +1051,143 @@ class MainActivity : Activity() {
         }
     }
 
-    // مراقبة إعادة التشغيل: ضغط تلقائي + تأكيد + إعادة محاولة + وضع المراقبة اليدوية
+    // ================= الواي فاي بعد الريبوت (سبب التوقف السابق) =================
+    // بعد الريبوت قد يختار أندرويد بيانات الهاتف كشبكة افتراضية فتفشل كل الاتصالات المحلية؛ لذلك نربط التطبيق بالواي فاي
+    private fun bindToWifi(): Boolean = try {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val n = cm.allNetworks.firstOrNull { cm.getNetworkCapabilities(it)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true }
+        if (n != null) { cm.bindProcessToNetwork(n); true } else false
+    } catch (e: Exception) { false }
+
+    private fun routerUp(gw: String): Boolean = listOf(80, 443, 8080).any { tcp(gw, it) >= 0 }
+
+    private fun nudgeWifi() {
+        try {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            if (!wm.isWifiEnabled) wm.isWifiEnabled = true
+            wm.reconnect()
+        } catch (e: Exception) {}
+    }
+
+    private fun awaitInternet() {
+        val t0 = System.currentTimeMillis()
+        var n = 0
+        while (System.currentTimeMillis() - t0 < 90_000L) {
+            bindToWifi()
+            if (dnsUdp("1.1.1.1") >= 0 || dnsUdp("8.8.8.8") >= 0) { log("🌐 الإنترنت رجع"); break }
+            if (n % 4 == 0) log("⏳ أنتظر عودة الإنترنت بعد إعادة التشغيل...")
+            n++
+            Thread.sleep(3000)
+        }
+        Thread.sleep(4000)
+    }
+
+    // ================= مراقبة إعادة التشغيل (لا تتوقف أبداً: تكمل للفحص والنتيجة دائماً) =================
     private fun rebooting(manualMode: Boolean) {
         val gw = gwIp
         log(if (manualMode) "🖐 اضغط Reboot بنفسك في صفحة الراوتر (كبّرها بإصبعين)، وأنا أراقب وأكمل تلقائياً" else "🔄 تم الضغط على Reboot، أنتظر انقطاع الراوتر...")
         thread {
-            var down = false
-            var i = 0
-            val limit = if (manualMode) 40 else 12
-            while (!down && i < limit) {
-                Thread.sleep(3000)
-                if (!manualMode && i < 4) runOnUiThread { web.evaluateJavascript(confirmJs, null) }
-                if (tcp(gw, 80) < 0) down = true
-                i++
-            }
-            if (!down) {
-                if (!manualMode && rebootTry < 2) {
-                    rebootTry++
-                    log("⚠ الراوتر لم ينقطع، أعيد المحاولة ($rebootTry/2)")
-                    runOnUiThread { moveTo("reboot"); ui.postDelayed({ step() }, 800) }
+            try {
+                var down = false
+                var i = 0
+                val limit = if (manualMode) 40 else 12
+                while (!down && i < limit) {
+                    Thread.sleep(3000)
+                    bindToWifi()
+                    if (!manualMode && i < 4) runOnUiThread { web.evaluateJavascript(confirmJs, null) }
+                    if (!routerUp(gw)) down = true
+                    i++
+                }
+                if (!down) {
+                    if (!manualMode && rebootTry < 2) {
+                        rebootTry++
+                        log("⚠ الراوتر لم ينقطع، أعيد المحاولة ($rebootTry/2)")
+                        runOnUiThread { moveTo("reboot"); ui.postDelayed({ step() }, 800) }
+                        return@thread
+                    }
+                    if (!manualMode) { runOnUiThread { rebooting(true) }; return@thread }
+                    setStep(6, 3)
+                    rebootOk = false
+                    finalizeRun("⚠ لم أتأكد من إعادة تشغيل الراوتر (أعد تشغيله يدوياً)")
                     return@thread
                 }
-                if (!manualMode) { runOnUiThread { rebooting(true) }; return@thread }
-                setStep(6, 3)
-                lastReport = (audit + report).joinToString("\n") + "\n\n⚠ لم أتأكد أن الراوتر أعاد التشغيل. أعد تشغيله يدوياً." + manual()
-                setReport(lastReport); setChip("● يحتاج تدخل", cAmber); endRun()
-                return@thread
+                rebootOk = true
+                log("📴 الراوتر انقطع، أنتظر رجوعه...")
+                val t0 = System.currentTimeMillis()
+                var up = false
+                var lastNote = 0L
+                while (!up && System.currentTimeMillis() - t0 < 240_000L) {
+                    bindToWifi()
+                    if (routerUp(gw)) {
+                        up = true
+                    } else {
+                        val el = (System.currentTimeMillis() - t0) / 1000
+                        if (el - lastNote >= 15) {
+                            lastNote = el
+                            log("⏳ أنتظر رجوع الراوتر والواي فاي... (${el}ث)")
+                            nudgeWifi()
+                        }
+                        if (el in 100L..110L) log("📶 لو الواي فاي لم يتصل تلقائياً، اتصل بشبكتك يدوياً وسأكمل")
+                        Thread.sleep(3000)
+                    }
+                }
+                setStep(6, if (up) 2 else 3)
+                if (up) log("✅ الراوتر رجع") else log("⚠ لم أصل لصفحة الراوتر، سأكمل قياس الجودة على أي حال")
+                finalizeRun(if (up) "✅ تمت إعادة تشغيل الراوتر فعلياً (انقطع ثم رجع)" else "⚠ الراوتر أعاد التشغيل لكن لم أستطع الوصول لصفحته بعد رجوعه")
+            } catch (e: Exception) {
+                log("❌ خطأ أثناء المراقبة: ${e.message}")
+                finalizeRun("⚠ حدث خطأ أثناء مراقبة إعادة التشغيل")
             }
-            log("📴 الراوتر انقطع، أنتظر رجوعه...")
-            var up = false
-            var n = 0
-            while (!up && n < 45) { if (tcp(gw, 80) >= 0) up = true else { Thread.sleep(4000); n++ } }
-            if (!up) {
-                setStep(6, 3)
-                lastReport = (audit + report).joinToString("\n") + "\n\n⚠ الراوتر لم يرجع بعد. أعد توصيل الواي فاي ثم افحص من جديد."
-                setReport(lastReport); setChip("● يحتاج تدخل", cAmber); endRun()
-                return@thread
-            }
-            setStep(6, 2)
-            setStep(7, 1)
-            log("✅ الراوتر رجع. أقيس السرعة بعد الإصلاح...")
-            Thread.sleep(15000)
-            val (after, _) = speedRetry()
-            showFinal("✅ تمت إعادة تشغيل الراوتر فعلياً (انقطع ثم رجع)", after)
         }
+    }
+
+    // ================= الفحص بعد الإصلاح ← المقارنة ← تسجيل الخروج ← النتيجة =================
+    private fun finalizeRun(msg: String) {
+        try {
+            bindToWifi()
+            setStep(7, 1)
+            if (rebootOk) awaitInternet()
+            log("⏱ أقيس السرعة بعد الإصلاح...")
+            val (after, _) = speedRetry()
+            log("⏱ أقيس استقرار الـ Ping بعد الإصلاح...")
+            val pa = pingStats(20)
+            gwAfter = stats({ tcp(gwIp, 80) }).first
+            pingA = pa
+            scoreA = health(pa.first, pa.second, pa.third, after)
+            updatePingCard()
+            runOnUiThread {
+                afterTv.text = mb(after)
+                if (beforeSpeed > 0 && after > 0) {
+                    val pct = (after - beforeSpeed) / beforeSpeed * 100
+                    gainTv.text = (if (pct >= 0) "+" else "") + "%.0f%%".format(pct)
+                    gainTv.setTextColor(if (pct >= 0) cGreen else cRed)
+                }
+            }
+            setStep(7, 2)
+            setStep(8, 1)
+            log("🚪 أسجّل الخروج من صفحة الراوتر...")
+            doLogout()
+            setStep(8, 2)
+            showFinal(msg, after, pa)
+        } catch (e: Exception) {
+            log("❌ خطأ أثناء الفحص النهائي: ${e.message}")
+            setChip("● خطأ", cRed)
+            endRun()
+        }
+    }
+
+    private fun doLogout() {
+        val latch = java.util.concurrent.CountDownLatch(1)
+        runOnUiThread {
+            web.evaluateJavascript(logoutJs, null)
+            ui.postDelayed({
+                CookieManager.getInstance().removeAllCookies(null)
+                web.clearCache(true); web.loadUrl("about:blank")
+                latch.countDown()
+            }, 2000)
+        }
+        latch.await(6, java.util.concurrent.TimeUnit.SECONDS)
+        loggedOut = true
     }
 
     private fun endRun() {
@@ -1056,18 +1197,8 @@ class MainActivity : Activity() {
 
     private fun finish(msg: String) {
         log(msg)
-        setStep(7, 1)
-        log("🚪 جاري تسجيل الخروج من صفحة الراوتر...")
-        web.evaluateJavascript(logoutJs, null)
-        ui.postDelayed({
-            CookieManager.getInstance().removeAllCookies(null)
-            web.clearCache(true); web.loadUrl("about:blank")
-            thread {
-                Thread.sleep(4000)
-                val (after, _) = speedRetry()
-                showFinal("$msg\n🚪 تم تسجيل الخروج من الراوتر", after)
-            }
-        }, 4000)
+        if (stepState[6] == 0 || stepState[6] == 1) setStep(6, 3)
+        thread { finalizeRun(msg) }
     }
 
     private fun manual(): String {
@@ -1078,47 +1209,86 @@ class MainActivity : Activity() {
         return if (s.isEmpty()) "" else "\n\n🖐 خطوات يدوية (واجهة راوترك مختلفة عن المتوقع):\n" + s.joinToString("\n")
     }
 
-    private fun advice(after: Double): String = when {
-        after in 0.0..5.0 -> "⚠ السرعة ما زالت منخفضة بعد الضبط، يعني السبب خارج الراوتر: خط شركة الإنترنت أو الباقة. اضغط «نسخ التقرير» وأرسله للشركة واطلب فحص الخط."
-        beforeSpeed > 0 && after > beforeSpeed * 1.3 -> "✅ تحسّنت السرعة بشكل واضح بعد الإصلاح."
-        devices > 8 -> "💡 عدد الأجهزة المتصلة كبير ($devices). افصل غير المستخدم من الراوتر."
-        else -> "💡 الشبكة مستقرة. لو ما زلت تشعر بالبطء جرّب الاقتراب من الراوتر أو استخدام كابل."
+    // ================= ترتيب الـ DNS ونسبة النجاح =================
+    private fun dnsRankText(): String {
+        if (dnsRank.isEmpty()) return "لم يتم القياس"
+        return dnsRank.take(11).mapIndexed { i, p ->
+            val name = (dnsNames[p.first] ?: "DNS المزوّد") + (if (p.first == curDnsAtStart) " (الحالي)" else "")
+            val mark = if (p.first == bestDns) " ⭐" else if (p.first == bestDns2) " ✔" else ""
+            "${i + 1}. $name ${p.first} — ${p.second.toInt()}ms$mark"
+        }.joinToString("\n")
     }
 
-    private fun showFinal(msg: String, after: Double) {
+    private fun renderDns() { val t = dnsRankText(); runOnUiThread { dnsTv.text = t } }
+
+    // نسبة النجاح = 40% اكتمال المهام + 40% صحة الشبكة بعد الإصلاح + 20% مقدار التحسّن
+    private fun successScore(after: Double): Int {
+        var tasks = 0
+        if (dnsRank.isNotEmpty()) tasks += 10
+        if (dnsDone) tasks += 20
+        if (chanDone) tasks += 20
+        if (!rebootPlanned || rebootOk) tasks += 25
+        if (after > 0) tasks += 15
+        if (loggedOut) tasks += 10
+        scTasks = tasks
+        scImpr = (50 + (scoreA - scoreB) * 2.5).coerceIn(0.0, 100.0).toInt()
+        return (tasks * 0.4 + scoreA * 0.4 + scImpr * 0.2).toInt().coerceIn(0, 100)
+    }
+
+    private fun ms(x: Double) = if (x < 0) "—" else "${x.toInt()}ms"
+
+    private fun advice(after: Double, pa: Triple<Double, Double, Int>): String {
+        val tips = mutableListOf<String>()
+        if (after in 0.0..5.0) tips += "⚠ السرعة ما زالت منخفضة بعد الضبط: السبب خارج الراوتر (خط الشركة أو الباقة). انسخ التقرير وأرسله للشركة."
+        else if (beforeSpeed > 0 && after > beforeSpeed * 1.3) tips += "✅ تحسّنت السرعة بشكل واضح."
+        if (pa.second > 15 || pa.third > 2) tips += "📉 الـ Ping لسه غير مستقر (تذبذب ${pa.second.toInt()}ms، فقد ${pa.third}%): جرّب 5GHz أو كابل وقلّل الأجهزة المتصلة."
+        else if (pa.first in 0.0..60.0) tips += "✅ الـ Ping مستقر."
+        if (devices > 8) tips += "💡 عدد الأجهزة المتصلة كبير ($devices). افصل غير المستخدم."
+        if (tips.isEmpty()) tips += "💡 الشبكة مستقرة."
+        return tips.joinToString("\n")
+    }
+
+    private fun showFinal(msg: String, after: Double, pa: Triple<Double, Double, Int>) {
         val sp = getSharedPreferences("nf", 0)
         val prev = sp.getFloat("last", -1f)
-        log("⏱ أقيس استقرار الـ Ping بعد الإصلاح...")
-        val pa = pingStats(20)
-        pingA = pa
-        scoreA = health(pa.first, pa.second, pa.third, after)
-        updatePingCard()
+        val pct = if (restoring) -1 else successScore(after)
         val sb = StringBuilder()
         sb.append(msg).append("\n\n")
+        if (pct >= 0) sb.append("🏆 نسبة نجاح الاختبار: $pct/100\n(اكتمال المهام $scTasks/100 • صحة الشبكة بعد $scoreA/100 • التحسّن $scImpr/100)\n\n")
         if (audit.isNotEmpty()) sb.append("🧪 فحص الراوتر:\n").append(audit.joinToString("\n")).append("\n\n")
         if (report.isNotEmpty()) sb.append("🛠 ما تم تنفيذه:\n").append(report.joinToString("\n")).append("\n\n")
+        sb.append("🧭 ترتيب أسرع DNS:\n").append(dnsRankText()).append("\n\n")
         sb.append(diagText).append("\n\n")
-        sb.append("📈 السرعة قبل: ${fmt(beforeSpeed)}\n📈 السرعة بعد: ${fmt(after)}\n")
-        sb.append("⏱ Ping قبل: ${pingLine(pingB)}\n⏱ Ping بعد: ${pingLine(pa)}\n🏥 درجة صحة الشبكة: $scoreB ← $scoreA\n")
+        sb.append("📊 المقارنة قبل ← بعد\n")
+        sb.append("السرعة: ${fmt(beforeSpeed)} ← ${fmt(after)}\n")
+        sb.append("Ping: ${pingLine(pingB)}\n  ← ${pingLine(pa)}\n")
+        sb.append("الراوتر: ${ms(gwBefore)} ← ${ms(gwAfter)}\n")
+        sb.append("درجة صحة الشبكة: $scoreB ← $scoreA\n")
         if (prev > 0) sb.append("🕘 آخر فحص سابق: ${fmt(prev.toDouble())}\n")
         if (after > 0) sp.edit().putFloat("last", after.toFloat()).apply()
-        sb.append("\n🎯 التشخيص النهائي: $primary\n").append(advice(after))
+        sb.append("\n🎯 التشخيص النهائي: $primary\n").append(advice(after, pa))
         sb.append(manual())
-        if (hasBackup()) sb.append("\n\n↩ تقدر ترجّع إعدادات الراوتر السابقة بزر «استرجاع».")
+        sb.append("\n\n🚪 تم تسجيل الخروج من الراوتر")
+        if (hasBackup()) sb.append("\n↩ تقدر ترجّع إعدادات الراوتر السابقة بزر «استرجاع».")
         lastReport = sb.toString()
 
         runOnUiThread {
-            afterTv.text = mb(after)
-            if (beforeSpeed > 0 && after > 0) {
-                val pct = (after - beforeSpeed) / beforeSpeed * 100
-                gainTv.text = (if (pct >= 0) "+" else "") + "%.0f%%".format(pct)
-                gainTv.setTextColor(if (pct >= 0) cGreen else cRed)
+            if (pct >= 0) {
+                resultCard.alpha = 0f; resultCard.visibility = View.VISIBLE
+                resultCard.animate().alpha(1f).setDuration(500).start()
+                val col = if (pct >= 80) cGreen else if (pct >= 55) cAmber else cRed
+                resultPct.setTextColor(col)
+                resultBarV.progressTintList = ColorStateList.valueOf(col)
+                resultSub.text = "اكتمال المهام $scTasks/100  •  صحة الشبكة $scoreA/100  •  التحسّن $scImpr/100\n" +
+                    (if (pct >= 80) "نتيجة ممتازة 🟢" else if (pct >= 55) "نتيجة جيدة 🟡" else "تحتاج تدخلاً 🔴")
+                ValueAnimator.ofInt(0, pct).setDuration(1200).apply {
+                    addUpdateListener { a -> val v = a.animatedValue as Int; resultPct.text = "$v%"; resultBarV.progress = v }
+                }.start()
             }
         }
-        setStep(7, 2)
         setReport(lastReport)
-        setChip("● اكتمل", cGreen)
-        log("🏁 انتهى. التقرير الكامل في الأعلى")
+        setChip(if (pct >= 55 || pct < 0) "● اكتمل" else "● يحتاج تدخل", if (pct >= 55 || pct < 0) cGreen else cAmber)
+        log("🏁 انتهى الاختبار" + (if (pct >= 0) " — نسبة النجاح $pct%" else ""))
         endRun()
     }
 }
