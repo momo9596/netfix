@@ -16,17 +16,24 @@ import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.net.http.SslError
 import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.HttpAuthHandler
 import android.webkit.JsResult
+import android.webkit.RenderProcessGoneDetail
+import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
@@ -38,6 +45,7 @@ import android.widget.ScrollView
 import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
+import org.json.JSONArray
 import org.json.JSONObject
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -49,14 +57,43 @@ import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.Callable
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
 
-data class ChanScan(val best: Int, val count: Int, val curBad: Boolean)
+// ---------- نماذج البيانات ----------
+data class ChanScan(val ok: Boolean, val count: Int, val loads: Map<Int, Double>, val note: String)
+data class PingRes(val avg: Double, val jitter: Double, val loss: Int, val method: String)
+data class DnsRes(val server: String, val avg: Double, val median: Double, val success: Int, val score: Double)
+data class Reach(val gw: Boolean, val tcp: Boolean, val udp: Boolean, val http: Boolean) {
+    val internet: Boolean get() = tcp || udp || http
+}
+data class Speed(val down: Double, val up: Double, val loaded: Double)
+data class Snap(val reach: Reach, val gwMs: Double, val gwLoss: Int, val ping: PingRes, val sp: Speed)
+class Plan {
+    var dns = false; var d1 = ""; var d2 = ""
+    var chan = false; var ch = 0
+    var wid = ""
+}
+
+/** تُرمى عند طلب الإيقاف. ترث Error حتى لا تلتقطها catch (e: Exception) بالخطأ. */
+class Cancelled : Error()
 
 @Suppress("DEPRECATION")
 class MainActivity : Activity() {
+
+    companion object {
+        const val DL_CAP = 30_000_000L      // حد أقصى لتنزيل اختبار واحد
+        const val UL_CAP = 8_000_000L       // حد أقصى لرفع اختبار واحد
+        const val TOTAL_CAP = 100_000_000L  // حد أقصى لاستهلاك البيانات في التشغيل الواحد
+        const val STAGE_TTL = 20 * 60 * 1000L
+        const val ROUTER_TICKS = 70
+    }
+
     // ---------- ألوان التصميم ----------
     private val cBg = Color.parseColor("#0B1220")
     private val cCard = Color.parseColor("#111B30")
@@ -78,6 +115,7 @@ class MainActivity : Activity() {
     private lateinit var startBtn: Button
     private lateinit var fixBtn: Button
     private lateinit var restoreBtn: Button
+    private lateinit var stopBtn: Button
     private lateinit var chip: TextView
     private lateinit var bar: ProgressBar
     private lateinit var beforeTv: TextView
@@ -90,52 +128,6 @@ class MainActivity : Activity() {
     private lateinit var reportView: TextView
     private lateinit var liveWeb: TextView
     private lateinit var modeBtn: TextView
-    private val stepViews = mutableListOf<TextView>()
-    private val stepNames = listOf(
-        "فحص الشبكة والسرعة", "قياس أسرع DNS", "مسح القنوات", "الدخول لصفحة الراوتر",
-        "تطبيق DNS", "ضبط القناة والعرض", "إعادة تشغيل الراوتر", "قياس الجودة والـ Ping بعد الإصلاح", "تسجيل الخروج والنتيجة النهائية"
-    )
-    private val stepState = IntArray(9)
-    private var webFull = false
-
-    // ---------- الحالة ----------
-    private var bestCh = 6
-    private var bestDns = "1.1.1.1"
-    private var bestDns2 = "8.8.8.8"
-    private var dnsWorth = true
-    private var dnsReport = ""
-    private var beforeSpeed = -1.0
-    private var crowded = false
-    private var lowSpeed = false
-    private var lineProblem = false
-    private var oldUptime = false
-    private var running = false
-    private var diagBusy = false
-    private var changed = false
-    private var restoring = false
-    private var restoreWid = ""
-    private var dnsDone = false
-    private var chanDone = false
-    private var devices = -1
-    private var phase = "status"
-    private var ticks = 0
-    private var pt = 0
-    private var loginTries = 0
-    private var rebootTry = 0
-    private var gwIp = ""
-    private var pingB: Triple<Double, Double, Int> = Triple(-1.0, 0.0, 0)
-    private var pingA: Triple<Double, Double, Int>? = null
-    private var scoreB = 0
-    private var scoreA = 0
-    private var rebootOk = false
-    private var rebootPlanned = false
-    private var loggedOut = false
-    private var gwBefore = -1.0
-    private var gwAfter = -1.0
-    private var dnsRank: List<Pair<String, Double>> = emptyList()
-    private var curDnsAtStart = ""
-    private var scTasks = 0
-    private var scImpr = 0
     private lateinit var dnsTv: TextView
     private lateinit var resultCard: LinearLayout
     private lateinit var resultPct: TextView
@@ -149,20 +141,86 @@ class MainActivity : Activity() {
     private lateinit var wizUser: EditText
     private lateinit var wizPass: EditText
     private lateinit var wizErr: TextView
-    private var connecting = false
-    private var connTicks = 0
-    private var ipFails = 0
+    private val stepViews = mutableListOf<TextView>()
+    private val stepNames = listOf(
+        "فحص الشبكة والسرعة", "قياس أسرع DNS", "مسح القنوات", "الدخول لصفحة الراوتر",
+        "تطبيق DNS", "ضبط القناة والعرض", "إعادة تشغيل الراوتر", "قياس الجودة والـ Ping بعد الإصلاح", "تسجيل الخروج والنتيجة النهائية"
+    )
+    private val stepState = IntArray(9)
+    private var webFull = false
+
+    // ---------- حالة التشغيل (مشتركة بين الخيوط) ----------
+    @Volatile private var busy = false
+    @Volatile private var destroyed = false
+    private val cancelled = AtomicBoolean(false)
+    private val approved = AtomicBoolean(false)   // موافقة المستخدم على الإجراءات (تسمح بتأكيد نوافذ الراوتر)
+    private val webDead = AtomicBoolean(false)
+    private val dataUsed = AtomicLong(0)
+    @Volatile private var restoring = false
+    private var locGranted = false
+
+    // بيانات الدخول (تُقرأ من الواجهة قبل بدء الخيط، ولا تُحفظ)
+    private var credUser = ""
+    private var credPass = ""
+    private var authTries = 0
+    private var loginTries = 0
+    private var loginStuck = false
+    private var pt = 0
+
+    // هوية الراوتر والشبكة
+    private var gwIp = ""
+    private var lockSsid = ""
+    private var lockBssid = ""
+    private var lockTitle = ""
+    private var vendor = ""
+    private var unknownUi = false
+    private var gwPort = 80
+
+    // قراءات الراوتر (للقراءة فقط قبل أي تعديل)
+    private var rDnsOk = false; private var rDns1 = ""; private var rDns2 = ""
+    private var rChOk = false; private var rCh = -1; private var rWd = ""; private var rMd = ""
+    private var rChOpts: List<Int> = emptyList(); private var rWopts: List<String> = emptyList()
+    private var devices = -1
+    private var oldUptime = false
+
+    // نتائج القياس
+    private var phoneCh = 0
+    private var bestDns = ""
+    private var bestDns2 = ""
+    private var dnsWorth = false
+    private var dnsReport = ""
+    private var dnsRank: List<DnsRes> = emptyList()
+    private var curDnsAtStart = ""
+    private var scan = ChanScan(false, 0, emptyMap(), "")
+    private var bDown = -1.0; private var bUp = -1.0; private var bLoaded = -1.0
+    private var aDown = -1.0; private var aUp = -1.0
+    private var pingB = PingRes(-1.0, 0.0, 100, "none")
+    private var pingA: PingRes? = null
+    private var gwBefore = -1.0
+    private var gwAfter = -1.0
+    private var scoreB = 0
+    private var scoreA = 0
+    private var afterValid = false
+    private var lowSpeed = false
+    private var lineProblem = false
     private var primary = ""
     private var diagText = ""
     private var lastReport = ""
     private var lastLog = ""
-    private val logLines = mutableListOf<String>()
-    private val report = mutableListOf<String>()
+    private var plannedCount = 0
+    private var verifiedCount = 0
+    private var rebootPlanned = false
+    private var rebootOk = false
+    private var loggedOut = false
+    private var changedAny = false
+
+    private val okList = mutableListOf<String>()     // تغييرات تم التحقق منها
+    private val failList = mutableListOf<String>()   // تغييرات فشلت وسببها
+    private val skipList = mutableListOf<String>()   // عمليات تم تخطيها وسببها
     private val audit = mutableListOf<String>()
-    private val order = listOf("status", "dns", "clients", "chan")
+    private val logLines = mutableListOf<String>()
     private val ui = Handler(Looper.getMainLooper())
 
-    // 10 مزوّدين مختلفين (مرشّحون فقط)، والترتيب والاختيار بالقياس الحي
     private val dnsCandidates = listOf(
         "1.1.1.1", "8.8.8.8", "9.9.9.9", "208.67.222.222", "94.140.14.140",
         "76.76.2.0", "64.6.64.6", "4.2.2.1", "84.200.69.80", "8.26.56.26"
@@ -242,7 +300,7 @@ class MainActivity : Activity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
-        requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION), 1)
+        if (!hasLoc()) requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION), 1) else locGranted = true
         window.statusBarColor = cBg
         window.navigationBarColor = cBg
         window.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
@@ -286,21 +344,27 @@ class MainActivity : Activity() {
 
         // الأزرار
         startBtn = gradBtn("🔄 إعادة الفحص والتحسين", cCyan, cBlue)
-        startBtn.setOnClickListener {
-            if (running || diagBusy || connecting) return@setOnClickListener
-            startBtn.isEnabled = false
-            connectRouter()
-        }
+        startBtn.setOnClickListener { if (!busy) startRun(false) }
         dash.addView(startBtn)
+
+        stopBtn = Button(this).apply {
+            text = "⛔ إيقاف العملية"; setAllCaps(false); textSize = 13f; setTextColor(Color.WHITE)
+            background = bg(Color.parseColor("#7F1D1D"), 14)
+            layoutParams = LinearLayout.LayoutParams(-1, dp(44)).apply { topMargin = dp(8) }
+            visibility = View.GONE
+            setOnClickListener { if (busy) { cancelled.set(true); log("⛔ طُلب الإيقاف، أُنهي المهام الجارية...") } }
+        }
+        dash.addView(stopBtn)
+
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) }
         }
-        fixBtn = smallBtn("🔁 إعادة المحاولة").apply { isEnabled = false; setOnClickListener { openRouter(); applyFixes() } }
-        restoreBtn = smallBtn("↩ استرجاع").apply { isEnabled = hasBackup(); setOnClickListener { restoreBackup() } }
+        fixBtn = smallBtn("🔁 إعادة المحاولة").apply { isEnabled = false; setOnClickListener { if (!busy) startRun(false) } }
+        restoreBtn = smallBtn("↩ استرجاع").apply { isEnabled = hasBackup(); setOnClickListener { if (!busy) startRun(true) } }
         val copyBtn = smallBtn("📋 نسخ التقرير").apply { setOnClickListener { copyReport() } }
         val settingsBtn = smallBtn("⚙ بيانات الراوتر").apply {
-            setOnClickListener { if (!running && !diagBusy && !connecting) showWizard(1, "") }
+            setOnClickListener { if (!busy) showWizard(1, "") }
         }
         row.addView(fixBtn); row.addView(restoreBtn); row.addView(copyBtn); row.addView(settingsBtn)
         dash.addView(row)
@@ -338,7 +402,7 @@ class MainActivity : Activity() {
 
         // مقارنة السرعة
         val spCard = cardBox()
-        spCard.addView(label("📈 السرعة", 13f, cMuted))
+        spCard.addView(label("📈 السرعة (تنزيل)", 13f, cMuted))
         val spRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) }
@@ -358,7 +422,7 @@ class MainActivity : Activity() {
 
         val dnsCard = cardBox()
         dnsCard.addView(label("🧭 ترتيب أسرع DNS (قياس حي)", 13f, cMuted))
-        dnsTv = label("سيظهر ترتيب أسرع 10 DNS بعد القياس", 12f, cText).apply { typeface = Typeface.MONOSPACE; setPadding(0, dp(8), 0, 0) }
+        dnsTv = label("سيظهر ترتيب أسرع DNS بعد القياس", 12f, cText).apply { typeface = Typeface.MONOSPACE; setPadding(0, dp(8), 0, 0) }
         dnsCard.addView(dnsTv)
         dash.addView(dnsCard)
 
@@ -411,8 +475,10 @@ class MainActivity : Activity() {
             settings.setSupportZoom(true); settings.builtInZoomControls = true
             settings.displayZoomControls = false
             settings.useWideViewPort = true; settings.loadWithOverviewMode = true
+            settings.allowFileAccess = false
             setBackgroundColor(Color.WHITE)
             layoutParams = LinearLayout.LayoutParams(-1, 0, 1f)
+            webViewClient = routerClient
             webChromeClient = object : WebChromeClient() {
                 private fun risky(m: String): Boolean {
                     val ic = RegexOption.IGNORE_CASE
@@ -420,8 +486,10 @@ class MainActivity : Activity() {
                     return Regex("factory|مصنع", ic).containsMatchIn(m) ||
                         (!rb && Regex("default|restore|reset|افتراض", ic).containsMatchIn(m))
                 }
+                // لا يُؤكَّد أي مربع حوار من الراوتر إلا بعد موافقة المستخدم على الإجراء، ولا يُؤكَّد أبداً إن كان فيه إعادة ضبط
                 override fun onJsConfirm(v: WebView, url: String, message: String, result: JsResult): Boolean {
-                    if (risky(message)) result.cancel() else result.confirm(); return true
+                    if (risky(message) || !approved.get()) result.cancel() else result.confirm()
+                    return true
                 }
                 override fun onJsAlert(v: WebView, url: String, message: String, result: JsResult): Boolean { result.confirm(); return true }
             }
@@ -435,6 +503,41 @@ class MainActivity : Activity() {
         frame.addView(wizard, FrameLayout.LayoutParams(-1, -1))
         setContentView(frame)
         showWizard(1, "")
+        checkResume()
+    }
+
+    // ================= دورة الحياة والصلاحيات =================
+    private fun hasLoc() = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        locGranted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+        if (!locGranted) Toast.makeText(this, "بدون صلاحية الموقع لن يعمل مسح القنوات وسيُتخطى", Toast.LENGTH_LONG).show()
+    }
+
+    override fun onDestroy() {
+        destroyed = true
+        cancelled.set(true)
+        ui.removeCallbacksAndMessages(null)
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            cm.bindProcessToNetwork(null)
+        } catch (e: Exception) {}
+        try {
+            web.stopLoading()
+            (web.parent as? ViewGroup)?.removeView(web)
+            web.destroy()
+        } catch (e: Exception) {}
+        super.onDestroy()
+    }
+
+    override fun onBackPressed() {
+        if (wizard.visibility == View.VISIBLE && wizP2.visibility == View.VISIBLE) { showWizard(1, ""); return }
+        if (busy) {
+            AlertDialog.Builder(this).setTitle("عملية جارية").setMessage("إيقاف العملية والخروج؟")
+                .setPositiveButton("إيقاف وخروج") { _, _ -> cancelled.set(true); super.onBackPressed() }
+                .setNegativeButton("استمرار", null).show()
+        } else super.onBackPressed()
     }
 
     // ================= شاشات البداية: IP ← بيانات الدخول ← تشغيل تلقائي =================
@@ -483,6 +586,7 @@ class MainActivity : Activity() {
 
     private fun showWizard(page: Int, msg: String) {
         runOnUiThread {
+            if (destroyed) return@runOnUiThread
             wizP1.visibility = if (page == 1) View.VISIBLE else View.GONE
             wizP2.visibility = if (page == 2) View.VISIBLE else View.GONE
             wizErr.text = msg
@@ -491,18 +595,15 @@ class MainActivity : Activity() {
         }
     }
 
-    override fun onBackPressed() {
-        if (wizard.visibility == View.VISIBLE && wizP2.visibility == View.VISIBLE) showWizard(1, "") else super.onBackPressed()
-    }
-
     private fun onIpNext() {
         val v = wizIp.text.toString().trim()
         if (!Regex("[A-Za-z0-9.-]+").matches(v) || !v.contains(".")) { wizErr.text = "اكتب عنواناً صحيحاً مثل 192.168.1.1"; return }
         wizErr.text = "⏳ أتحقق من الاتصال بالراوتر..."
-        thread {
+        thread(name = "netfix-ipcheck") {
             bindToWifi()
-            val ok = routerUp(v)
+            val ok = listOf(80, 443, 8080).any { tcp(v, it, 1500) >= 0 }
             runOnUiThread {
+                if (destroyed) return@runOnUiThread
                 if (ok) {
                     ipFails = 0
                     getSharedPreferences("nf", 0).edit().putString("router_ip", v).apply()
@@ -519,6 +620,7 @@ class MainActivity : Activity() {
             }
         }
     }
+    private var ipFails = 0
 
     private fun onGoClicked() {
         val u = wizUser.text.toString().trim()
@@ -528,55 +630,7 @@ class MainActivity : Activity() {
         getSharedPreferences("nf", 0).edit().putString("router_ip", v).putString("router_user", u).apply()
         wizErr.text = ""
         wizard.animate().alpha(0f).setDuration(350).withEndAction { wizard.visibility = View.GONE }.start()
-        connectRouter()
-    }
-
-    // ================= الدخول للراوتر ثم البدء التلقائي بمجرد ظهور الإعدادات =================
-    private fun connectRouter() {
-        if (connecting) return
-        connecting = true; connTicks = 0; loginTries = 0; pt = 0
-        gwIp = ip.text.toString().trim()
-        bindToWifi()
-        resetUi()
-        setChip("● جارٍ الدخول", cAmber)
-        setStep(3, 1)
-        log("🔌 أفتح صفحة الراوتر $gwIp وأسجّل الدخول...")
-        runOnUiThread { startBtn.isEnabled = false }
-        openRouter()
-        ui.postDelayed({ connectStep() }, 3000)
-    }
-
-    private fun connectStep() {
-        connTicks++
-        if (connTicks > 60) { loginFailed("لم تظهر إعدادات الراوتر خلال وقت معقول. تأكد من العنوان وبيانات الدخول."); return }
-        web.evaluateJavascript(js("status")) { raw ->
-            val r = try { JSONObject(raw ?: "") } catch (e: Exception) { null }
-            if (r != null && r.optBoolean("pw")) {
-                loginTries++
-                if (loginTries >= 5) { loginFailed("تعذّر تسجيل الدخول. تأكد من اسم المستخدم وكلمة المرور."); return@evaluateJavascript }
-                log(if (passEt.text.isNotEmpty() && loginTries <= 2) "🔐 أسجّل الدخول تلقائياً..." else "⏳ أنتظر نتيجة تسجيل الدخول... ($loginTries)")
-            } else if (r != null && r.optBoolean("found")) {
-                connecting = false
-                loginTries = 0
-                log("✅ ظهرت إعدادات الراوتر — أبدأ الفحص والتحسين تلقائياً")
-                setStep(3, 2)
-                diagnose(true)
-                return@evaluateJavascript
-            } else if (r != null) {
-                pt++
-                log("🔎 أبحث عن صفحة الإعدادات...")
-            }
-            ui.postDelayed({ connectStep() }, 2500)
-        }
-    }
-
-    private fun loginFailed(msg: String) {
-        connecting = false
-        setStep(3, 3)
-        setChip("● تعذّر الدخول", cRed)
-        log("❌ $msg")
-        runOnUiThread { startBtn.isEnabled = true }
-        showWizard(2, "❌ $msg")
+        startRun(false)
     }
 
     // ================= السجل والحالة =================
@@ -589,28 +643,29 @@ class MainActivity : Activity() {
             while (logLines.size > 200) logLines.removeAt(0)
         }
         val shown = synchronized(logLines) { logLines.takeLast(10).joinToString("\n") }
-        runOnUiThread { logView.text = shown; liveWeb.text = "🖥 $s" }
+        runOnUiThread { if (!destroyed) { logView.text = shown; liveWeb.text = "🖥 $s" } }
     }
 
     private fun say(s: String) = log(s)
-    private fun progress(extra: String) = log(extra)
 
-    private fun setChip(t: String, color: Int) = runOnUiThread { chip.text = t; chip.setTextColor(color) }
+    private fun setChip(t: String, color: Int) = runOnUiThread { if (!destroyed) { chip.text = t; chip.setTextColor(color) } }
 
     private fun setStep(i: Int, st: Int) {
         stepState[i] = st
         runOnUiThread {
-            val icon = when (st) { 1 -> "⏳"; 2 -> "✅"; 3 -> "⏭"; else -> "⚪" }
-            val col = when (st) { 1 -> cAmber; 2 -> cGreen; else -> cMuted }
+            if (destroyed) return@runOnUiThread
+            val icon = when (st) { 1 -> "⏳"; 2 -> "✅"; 3 -> "⏭"; 4 -> "❌"; else -> "⚪" }
+            val col = when (st) { 1 -> cAmber; 2 -> cGreen; 4 -> cRed; else -> cMuted }
             stepViews[i].text = "$icon  ${stepNames[i]}"
             stepViews[i].setTextColor(col)
-            ObjectAnimator.ofInt(bar, "progress", stepState.count { it == 2 || it == 3 } * 100 / stepState.size).setDuration(450).start()
+            ObjectAnimator.ofInt(bar, "progress", stepState.count { it >= 2 } * 100 / stepState.size).setDuration(450).start()
         }
     }
 
     private fun resetUi() {
         for (i in stepState.indices) setStep(i, 0)
         runOnUiThread {
+            if (destroyed) return@runOnUiThread
             beforeTv.text = "—"; afterTv.text = "—"; gainTv.text = "—"; gainTv.setTextColor(cMuted)
             pingTv.text = "جارٍ القياس..."
             dnsTv.text = "جارٍ القياس..."
@@ -620,6 +675,7 @@ class MainActivity : Activity() {
     }
 
     private fun setReport(t: String) = runOnUiThread {
+        if (destroyed) return@runOnUiThread
         reportView.text = t
         if (reportCard.visibility != View.VISIBLE) {
             reportCard.alpha = 0f; reportCard.visibility = View.VISIBLE
@@ -628,27 +684,29 @@ class MainActivity : Activity() {
     }
 
     private fun mb(x: Double) = if (x < 0) "—" else "%.1f".format(x)
+    private fun fmt(x: Double): String = if (x < 0) "فشل القياس" else "%.1f Mbps".format(x)
+    private fun ms(x: Double) = if (x < 0) "—" else "${x.toInt()}ms"
 
     // درجة صحة الشبكة من 100 (استجابة + تذبذب + فقد حزم + سرعة)
-    private fun health(avg: Double, j: Double, l: Int, sp: Double): Int {
+    private fun health(p: PingRes, sp: Double): Int {
         var s = 100.0
-        s -= if (avg < 0) 40.0 else Math.min(25.0, Math.max(0.0, (avg - 30) / 4))
-        s -= Math.min(25.0, j * 2.5)
-        s -= Math.min(25.0, l * 5.0)
+        s -= if (p.avg < 0) 40.0 else Math.min(25.0, Math.max(0.0, (p.avg - 30) / 4))
+        s -= Math.min(25.0, p.jitter * 2.5)
+        s -= Math.min(25.0, p.loss * 5.0)
         s -= if (sp < 0) 15.0 else if (sp < 5) 25.0 else if (sp < 15) 15.0 else if (sp < 30) 8.0 else 0.0
         return s.coerceIn(0.0, 100.0).toInt()
     }
 
     private fun verdict(sc: Int) = if (sc >= 85) "ممتاز 🟢" else if (sc >= 65) "جيد 🟡" else if (sc >= 40) "ضعيف 🟠" else "سيئ 🔴"
 
-    private fun pingLine(p: Triple<Double, Double, Int>) =
-        if (p.first < 0) "فشل القياس" else "${p.first.toInt()}ms | تذبذب ${p.second.toInt()}ms | فقد ${p.third}%"
+    private fun pingLine(p: PingRes) =
+        if (p.avg < 0) "فشل القياس (${p.method})" else "${p.avg.toInt()}ms | تذبذب ${p.jitter.toInt()}ms | فقد ${p.loss}% (${p.method})"
 
     private fun updatePingCard() {
         val a = pingA
         val txt = "قبل: ${pingLine(pingB)}\nدرجة الصحة: $scoreB/100 (${verdict(scoreB)})\n\n" +
             (if (a == null) "بعد: —" else "بعد: ${pingLine(a)}\nدرجة الصحة: $scoreA/100 (${verdict(scoreA)})")
-        runOnUiThread { pingTv.text = txt }
+        runOnUiThread { if (!destroyed) pingTv.text = txt }
     }
 
     private fun copyReport() {
@@ -658,44 +716,98 @@ class MainActivity : Activity() {
         Toast.makeText(this, "تم نسخ التقرير", Toast.LENGTH_SHORT).show()
     }
 
-    private fun fmt(x: Double): String = if (x < 0) "فشل القياس" else "%.1f Mbps".format(x)
-
-    private fun gateway(): String {
+    private fun gatewayRaw(): String = try {
         val g = (applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager).dhcpInfo.gateway
-        return if (g == 0) "192.168.0.1" else "%d.%d.%d.%d".format(g and 255, g shr 8 and 255, g shr 16 and 255, g shr 24 and 255)
+        if (g == 0) "" else "%d.%d.%d.%d".format(g and 255, g shr 8 and 255, g shr 16 and 255, g shr 24 and 255)
+    } catch (e: Exception) { "" }
+
+    private fun gateway(): String = gatewayRaw().ifEmpty { "192.168.0.1" }
+
+    private fun isIp(s: String) =
+        Regex("\\d{1,3}(\\.\\d{1,3}){3}").matches(s) && s.split(".").all { it.toInt() in 0..255 }
+
+    // ================= التحكم في المهام (إلغاء / انتظار / حوار) =================
+    private fun chk() { if (cancelled.get() || destroyed) throw Cancelled() }
+
+    private fun sleepC(totalMs: Long) {
+        var left = totalMs
+        while (left > 0) { chk(); val s = Math.min(left, 200L); Thread.sleep(s); left -= s }
     }
 
-    // ================= النسخة الاحتياطية والاسترجاع =================
-    private fun hasBackup(): Boolean {
-        val sp = getSharedPreferences("nf", 0)
-        return sp.contains("bk_ch") || sp.contains("bk_dns1")
+    /** سؤال المستخدم من خيط العمل (يحجب حتى الرد، ويُلغى عند الإيقاف). */
+    private fun askUser(title: String, msg: String, yes: String = "نعم، نفّذ", no: String = "لا"): Boolean {
+        val latch = CountDownLatch(1)
+        var res = false
+        runOnUiThread {
+            if (destroyed || isFinishing) { latch.countDown(); return@runOnUiThread }
+            AlertDialog.Builder(this).setTitle(title).setMessage(msg).setCancelable(false)
+                .setPositiveButton(yes) { _, _ -> res = true; latch.countDown() }
+                .setNegativeButton(no) { _, _ -> latch.countDown() }.show()
+        }
+        while (!latch.await(300, TimeUnit.MILLISECONDS)) chk()
+        return res
     }
 
-    private fun restoreBackup() {
-        if (running || diagBusy) return
-        val sp = getSharedPreferences("nf", 0)
-        if (!hasBackup()) { Toast.makeText(this, "لا توجد نسخة احتياطية", Toast.LENGTH_SHORT).show(); return }
-        restoring = true
-        dnsWorth = sp.contains("bk_dns1")
-        bestDns = sp.getString("bk_dns1", "") ?: ""
-        bestDns2 = sp.getString("bk_dns2", "") ?: ""
-        bestCh = sp.getInt("bk_ch", 0)
-        restoreWid = sp.getString("bk_wd", "") ?: ""
-        crowded = false
-        resetUi()
-        log("↩ استرجاع الإعدادات السابقة للراوتر")
-        openRouter()
-        applyFixes()
+    // ================= أدوات الشبكة =================
+    private fun bindToWifi(): Boolean = try {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val wifis = cm.allNetworks.filter { cm.getNetworkCapabilities(it)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true }
+        val n = wifis.firstOrNull { cm.getNetworkCapabilities(it)?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true } ?: wifis.firstOrNull()
+        if (n != null) { cm.bindProcessToNetwork(n); true } else false
+    } catch (e: Exception) { false }
+
+    private fun wifiInfoSafe(): Triple<String, String, Int> = try {
+        val i = (applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager).connectionInfo
+        val ss = (i.ssid ?: "").trim('"')
+        val bs = i.bssid ?: ""
+        Triple(if (ss == "<unknown ssid>") "" else ss, if (bs == "02:00:00:00:00:00") "" else bs, i.frequency)
+    } catch (e: Exception) { Triple("", "", 0) }
+
+    /** هل الهاتف متصل فعلاً بشبكة الراوتر المطلوب (واي فاي + نفس البوابة + نفس الاسم إن أمكن قراءته)؟ */
+    private fun onTargetNetwork(): Boolean = try {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val hasWifi = cm.allNetworks.any { cm.getNetworkCapabilities(it)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true }
+        if (!hasWifi) false
+        else {
+            val g = gatewayRaw()
+            val gwOk = !isIp(gwIp) || (g.isNotEmpty() && g == gwIp)
+            val ss = wifiInfoSafe().first
+            val ssOk = lockSsid.isEmpty() || ss.isEmpty() || ss == lockSsid
+            gwOk && ssOk
+        }
+    } catch (e: Exception) { false }
+
+    private fun nudgeWifi() {
+        try {
+            if (Build.VERSION.SDK_INT < 29) {
+                val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                if (!wm.isWifiEnabled) wm.isWifiEnabled = true
+                wm.reconnect()
+            }
+        } catch (e: Exception) {}
     }
 
-    // ================= أدوات القياس الحقيقية =================
-    private fun tcp(host: String, port: Int): Long = try {
+    private fun tcp(host: String, port: Int, timeout: Int = 1500): Long = try {
         val t = System.nanoTime()
-        Socket().use { it.connect(InetSocketAddress(host, port), 1500) }
+        Socket().use { it.connect(InetSocketAddress(host, port), timeout) }
         (System.nanoTime() - t) / 1_000_000
     } catch (e: Exception) { -1 }
 
-    private fun dnsQuery(server: String, host: String, timeout: Int = 1500): Long {
+    private fun tcpAny(host: String): Long {
+        for (p in listOf(80, 443, 8080, 53)) { val x = tcp(host, p, 1200); if (x >= 0) return x }
+        return -1
+    }
+
+    private fun httpPing(): Long = try {
+        val t = System.nanoTime()
+        val c = URL("https://cp.cloudflare.com/generate_204").openConnection() as HttpURLConnection
+        c.connectTimeout = 3000; c.readTimeout = 3000; c.instanceFollowRedirects = false
+        val code = c.responseCode
+        c.disconnect()
+        if (code in 200..399) (System.nanoTime() - t) / 1_000_000 else -1
+    } catch (e: Exception) { -1 }
+
+    private fun dnsQuery(server: String, host: String, timeout: Int = 1000): Long {
         val id = (Math.random() * 65535).toInt()
         val bo = java.io.ByteArrayOutputStream()
         bo.write(byteArrayOf((id shr 8).toByte(), id.toByte(), 1, 0, 0, 1, 0, 0, 0, 0, 0, 0))
@@ -718,244 +830,284 @@ class MainActivity : Activity() {
         } catch (e: Exception) { -1 }
     }
 
-    private fun dnsUdp(server: String): Long = dnsQuery(server, "example.com")
+    /** يميّز: الراوتر / الإنترنت عبر TCP / عبر UDP / عبر HTTP. حظر UDP وحده لا يعني انقطاع الإنترنت. */
+    private fun reach(): Reach {
+        val gw = listOf(80, 443, 8080, 53).any { tcp(gwIp, it, 1200) >= 0 }
+        val tcpOk = tcp("1.1.1.1", 443, 1500) >= 0 || tcp("8.8.8.8", 443, 1500) >= 0
+        val udpOk = dnsQuery("1.1.1.1", "example.com", 1200) >= 0 || dnsQuery("8.8.8.8", "example.com", 1200) >= 0
+        val httpOk = if (!tcpOk && !udpOk) httpPing() >= 0 else false
+        return Reach(gw, tcpOk, udpOk, httpOk)
+    }
 
-    private fun ispDns(): List<String> {
+    private fun ispDns(): List<String> = try {
         val d = (applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager).dhcpInfo
         fun ipOf(g: Int) = if (g == 0) null else "%d.%d.%d.%d".format(g and 255, g shr 8 and 255, g shr 16 and 255, g shr 24 and 255)
-        return listOfNotNull(ipOf(d.dns1), ipOf(d.dns2))
+        listOfNotNull(ipOf(d.dns1), ipOf(d.dns2))
+    } catch (e: Exception) { emptyList() }
+
+    private fun gwStats(): Pair<Double, Int> {
+        var port = -1
+        for (p in listOf(80, 443, 8080, 53)) { if (tcp(gwIp, p, 1200) >= 0) { port = p; break } }
+        if (port < 0) return Pair(-1.0, 100)
+        gwPort = port
+        val ok = (1..10).map { tcp(gwIp, port, 1200) }.filter { it >= 0 }
+        return Pair(if (ok.isEmpty()) -1.0 else ok.average(), (10 - ok.size) * 10)
     }
 
-    private fun dnsScore(server: String): Double {
-        val times = mutableListOf<Long>()
-        repeat(2) {
-            for (d in testDomains) {
-                val x = dnsQuery(server, d)
-                times.add(if (x < 0) 1500 else x)
-            }
+    /** Ping/Jitter/Loss: يختار أول وسيلة تعمل (TCP ثم UDP ثم HTTP) بدل الاعتماد على UDP وحده. */
+    private fun pingStats(n: Int): PingRes {
+        val methods = listOf<Pair<String, () -> Long>>(
+            "TCP 1.1.1.1:443" to { tcp("1.1.1.1", 443, 1500) },
+            "TCP 8.8.8.8:443" to { tcp("8.8.8.8", 443, 1500) },
+            "UDP DNS" to { dnsQuery("1.1.1.1", "example.com", 1200) },
+            "HTTP" to { httpPing() }
+        )
+        for ((name, f) in methods) {
+            chk()
+            var probe = false
+            for (i in 1..3) { if (f() >= 0) { probe = true; break } }
+            if (!probe) continue
+            val t = mutableListOf<Long>()
+            for (i in 1..n) { chk(); val x = f(); if (x >= 0) t.add(x); sleepC(100) }
+            val avg = if (t.isEmpty()) -1.0 else t.average()
+            var j = 0.0
+            for (i in 1 until t.size) j += Math.abs(t[i] - t[i - 1]).toDouble()
+            return PingRes(avg, if (t.size > 1) j / (t.size - 1) else 0.0, (n - t.size) * 100 / n, name)
         }
-        val sorted = times.sorted()
-        val median = sorted[sorted.size / 2].toDouble()
-        return median * 0.6 + times.average() * 0.4
+        return PingRes(-1.0, 0.0, 100, "لا توجد وسيلة تعمل")
     }
 
-    private fun benchmarkDns(): List<Pair<String, Double>> {
-        val all = (ispDns() + dnsCandidates).distinct()
-        val results = java.util.Collections.synchronizedList(mutableListOf<Pair<String, Double>>())
-        val ts = all.map { s -> thread { results.add(s to dnsScore(s)) } }
-        ts.forEach { it.join(30000) }
-        return ArrayList(results).filter { it.second < 1400 }.sortedBy { it.second }
-    }
-
-    private fun chooseDns(ranked: List<Pair<String, Double>>) {
-        if (ranked.isEmpty()) { dnsWorth = false; dnsReport = "🧭 تعذّر قياس DNS"; return }
-        val cur = ispDns().firstOrNull()
-        val curScore = ranked.firstOrNull { it.first == cur }?.second
-        val best = ranked[0]
-        bestDns = best.first
-        bestDns2 = ranked.getOrNull(1)?.first ?: "8.8.8.8"
-        dnsWorth = curScore == null || best.second < curScore * 0.9
-        if (!dnsWorth) bestDns = cur ?: best.first
-        dnsReport = "🧭 أفضل DNS: ${best.first} (${best.second.toInt()}ms)" +
-            (if (curScore != null) " | الحالي $cur (${curScore.toInt()}ms)" else "") +
-            if (dnsWorth) " ← سيتغيّر" else " ← الحالي مناسب"
-    }
-
-    private fun pickChannel(wm: WifiManager, curCh: Int): ChanScan = try {
-        pickChannelRaw(wm, curCh)
-    } catch (e: Exception) {
-        log("⚠ تعذّر مسح القنوات (فعّل الموقع وامنح الصلاحية)"); ChanScan(6, 0, false)
-    }
-
-    private fun pickChannelRaw(wm: WifiManager, curCh: Int): ChanScan {
-        val own = wm.connectionInfo.bssid
-        val seen = HashMap<String, Int>()
-        val freq = HashMap<String, Int>()
-        repeat(3) {
-            wm.startScan(); Thread.sleep(2500)
-            wm.scanResults.filter { it.frequency in 2400..2500 && it.BSSID != own }.forEach {
-                if (it.level > (seen[it.BSSID] ?: -200)) { seen[it.BSSID] = it.level; freq[it.BSSID] = it.frequency }
-            }
-        }
-        fun load(ch: Int): Double = seen.entries.sumOf { e ->
-            val apCh = (freq[e.key]!! - 2407) / 5
-            val d = Math.abs(apCh - ch)
-            if (d > 4) 0.0 else Math.pow(10.0, e.value / 10.0) * (5 - d) / 5.0
-        }
-        val best = listOf(1, 6, 11).minByOrNull { load(it) } ?: 6
-        val curBad = curCh != best && load(curCh) > load(best) * 2 && seen.isNotEmpty()
-        return ChanScan(best, seen.size, curBad)
-    }
-
-    private fun stats(f: () -> Long, n: Int = 10): Pair<Double, Int> {
-        val ok = (1..n).map { f() }.filter { it >= 0 }
-        return Pair(if (ok.isEmpty()) -1.0 else ok.average(), (n - ok.size) * 100 / n)
-    }
-
-    private fun pingStats(n: Int): Triple<Double, Double, Int> {
-        val t = mutableListOf<Long>()
-        for (i in 1..n) {
-            val x = dnsUdp("1.1.1.1")
-            if (x >= 0) t.add(x)
-            Thread.sleep(100)
-        }
-        val avg = if (t.isEmpty()) -1.0 else t.average()
-        var j = 0.0
-        for (i in 1 until t.size) j += Math.abs(t[i] - t[i - 1]).toDouble()
-        return Triple(avg, if (t.size > 1) j / (t.size - 1) else 0.0, (n - t.size) * 100 / n)
-    }
-
-    private fun speedLoaded(): Pair<Double, Double> {
+    /** اختبار تنزيل بحد أقصى للبيانات والمدة، قابل للإيقاف. يرجع (Mbps، زمن الاستجابة أثناء التحميل). */
+    private fun downloadTest(): Pair<Double, Double> {
+        if (dataUsed.get() + DL_CAP > TOTAL_CAP) { log("⚠ تخطّيت اختبار التنزيل: بلغتُ الحد الأقصى لاستهلاك البيانات"); return Pair(-1.0, -1.0) }
         val bytes = AtomicLong(0)
         val stop = AtomicBoolean(false)
         val lat = java.util.Collections.synchronizedList(mutableListOf<Long>())
         val conns = java.util.Collections.synchronizedList(mutableListOf<HttpURLConnection>())
+        val per = DL_CAP / 3
         val start = System.nanoTime()
         val workers = (1..3).map {
-            thread {
+            thread(name = "netfix-dl") {
                 try {
-                    val c = URL("https://speed.cloudflare.com/__down?bytes=25000000").openConnection() as HttpURLConnection
+                    val c = URL("https://speed.cloudflare.com/__down?bytes=$per").openConnection() as HttpURLConnection
                     conns.add(c)
-                    c.connectTimeout = 5000; c.readTimeout = 10000
+                    c.connectTimeout = 5000; c.readTimeout = 8000
                     c.inputStream.use { s ->
                         val buf = ByteArray(65536)
-                        while (!stop.get()) {
+                        while (!stop.get() && !cancelled.get()) {
                             val r = s.read(buf)
                             if (r < 0) break
-                            bytes.addAndGet(r.toLong())
+                            if (bytes.addAndGet(r.toLong()) >= DL_CAP) break
                         }
                     }
                 } catch (e: Exception) {}
             }
         }
-        val pinger = thread {
+        val pinger = thread(name = "netfix-lat") {
             try {
-                Thread.sleep(1500)
-                while (!stop.get()) {
-                    val x = dnsUdp("1.1.1.1")
+                Thread.sleep(1200)
+                while (!stop.get() && !cancelled.get()) {
+                    val x = tcp("1.1.1.1", 443, 1500)
                     if (x >= 0) lat.add(x)
                     Thread.sleep(300)
                 }
             } catch (e: Exception) {}
         }
-        val deadline = System.nanoTime() + 12_000_000_000L
-        while (System.nanoTime() < deadline && workers.any { it.isAlive }) Thread.sleep(200)
+        val deadline = System.nanoTime() + 10_000_000_000L
+        while (System.nanoTime() < deadline && workers.any { it.isAlive } && !cancelled.get() && bytes.get() < DL_CAP) Thread.sleep(150)
         stop.set(true)
         val secs = (System.nanoTime() - start) / 1e9
         val total = bytes.get()
         for (c in ArrayList(conns)) { try { c.disconnect() } catch (e: Exception) {} }
         pinger.join(1500)
+        dataUsed.addAndGet(total)
+        chk()
         val mbps = if (total > 0) total * 8 / secs / 1e6 else -1.0
         val l = ArrayList(lat)
         return Pair(mbps, if (l.isEmpty()) -1.0 else l.average())
     }
 
     private fun speedRetry(): Pair<Double, Double> {
-        for (i in 1..4) {
-            val r = speedLoaded()
+        for (i in 1..2) {
+            val r = downloadTest()
             if (r.first > 0) return r
-            Thread.sleep(5000)
+            sleepC(3000)
         }
         return Pair(-1.0, -1.0)
     }
 
-    // ================= التشخيص من جهة الهاتف =================
-    private fun diagnose(auto: Boolean = false) {
-        diagBusy = true
-        gwIp = ip.text.toString().trim()
-        fixBtn.isEnabled = false
-        resetUi()
-        setChip("● جارٍ العمل", cAmber)
-        val gw = gwIp
-        thread {
+    /** اختبار رفع منفصل ومحدود. القيمة تقريبية (جزء منها قد يكون في ذاكرة المقابس). */
+    private fun uploadTest(): Double {
+        if (dataUsed.get() + UL_CAP > TOTAL_CAP) { log("⚠ تخطّيت اختبار الرفع: بلغتُ الحد الأقصى لاستهلاك البيانات"); return -1.0 }
+        var sent = 0L
+        val start = System.nanoTime()
+        var end = start
+        try {
+            val c = URL("https://speed.cloudflare.com/__up").openConnection() as HttpURLConnection
+            c.requestMethod = "POST"; c.doOutput = true
+            c.connectTimeout = 5000; c.readTimeout = 12000
+            c.setFixedLengthStreamingMode(UL_CAP)
+            val buf = ByteArray(32768).also { java.util.Random().nextBytes(it) }
+            val deadline = start + 8_000_000_000L
             try {
-                bindToWifi()
-                val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-                val info = wm.connectionInfo
-                val is24 = info.frequency in 2400..2500
-                val curCh = if (is24) (info.frequency - 2407) / 5 else (info.frequency - 5000) / 5
-
-                setStep(0, 1)
-                say("⏳ فحص الاتصال بالراوتر..."); val (gwMs, gwLoss) = stats({ tcp(gw, 80) }); gwBefore = gwMs
-                say("⏳ فحص استقرار الإنترنت (20 قياساً)..."); val (netMs, jitter, netLoss) = pingStats(20)
-                say("⏳ اختبار السرعة (قد يستغرق دقيقة)..."); val (sp, loaded) = speedRetry(); beforeSpeed = sp
-                runOnUiThread { beforeTv.text = mb(sp) }
-                pingB = Triple(netMs, jitter, netLoss); pingA = null
-                scoreB = health(netMs, jitter, netLoss, sp)
-                updatePingCard()
-                setStep(0, 2)
-                lowSpeed = sp in 0.0..5.0
-                lineProblem = netLoss > 5 || netMs > 120
-                val bloat = loaded > 0 && netMs > 0 && loaded - netMs > 150
-
-                setStep(1, 1)
-                say("⏳ قياس أسرع DNS فعلياً (8 مواقع × كل سيرفر)...")
-                val ranked = benchmarkDns()
-                dnsRank = ranked; curDnsAtStart = ispDns().firstOrNull() ?: ""
-                chooseDns(ranked)
-                renderDns()
-                say(dnsReport)
-                setStep(1, 2)
-
-                setStep(2, 1)
-                say("⏳ مسح القنوات (3 مرات)...")
-                val cs = pickChannel(wm, curCh)
-                bestCh = cs.best
-                crowded = is24 && (cs.count > 5 || cs.curBad)
-                say("📡 أفضل قناة: $bestCh (${cs.count} شبكة مجاورة)")
-                setStep(2, 2)
-
-                val causes = mutableListOf<String>()
-                if (info.rssi < -75) causes += "📶 إشارة الواي فاي ضعيفة (${info.rssi}dBm): اقترب من الراوتر أو أزل العوائق."
-                if (info.linkSpeed in 1..20) causes += "🐌 سرعة وصلة الواي فاي بين هاتفك والراوتر منخفضة (${info.linkSpeed}Mbps)."
-                if (is24 && cs.curBad) causes += "📡 تداخل قنوات على القناة $curCh (${cs.count} شبكة قريبة) ← الحل: القناة $bestCh."
-                if (is24 && cs.count > 8) causes += "🏘 شبكات كثيرة حولك على 2.4GHz."
-                if (is24 && info.rssi > -65 && wm.is5GHzBandSupported) causes += "⚡ هاتفك يدعم 5GHz وإشارتك جيدة: اتصل بشبكة 5GHz (إن وُجدت) فهي أسرع وأقل ازدحاماً."
-                if (gwLoss > 5 || gwMs > 40) causes += "🔌 اتصالك بالراوتر غير مستقر (فقد $gwLoss%، ${gwMs.toInt()}ms): مشكلة واي فاي أو راوتر مضغوط."
-                if (lineProblem) causes += "🌐 الإنترنت نفسه غير مستقر (${netMs.toInt()}ms، فقد $netLoss%، تذبذب ${jitter.toInt()}ms): غالباً الخط أو المزوّد."
-                if (bloat) causes += "📉 عند التحميل يرتفع زمن الاستجابة من ${netMs.toInt()} إلى ${loaded.toInt()}ms: أي تحميل يبطّئ باقي الأجهزة."
-                if (dnsWorth && ranked.isNotEmpty()) causes += "🧭 يوجد DNS أسرع بشكل واضح من الحالي ← الحل: $bestDns."
-                if (sp in 0.0..5.0) causes += "🐢 سرعة التحميل منخفضة جداً (${fmt(sp)})."
-                if (causes.isEmpty()) causes += "✅ لم أجد مشكلة واضحة."
-
-                primary = when {
-                    info.rssi < -75 || gwLoss > 5 || gwMs > 40 -> "المشكلة عندك محلياً: ضعف الواي فاي أو بعدك عن الراوتر أو ازدحام القنوات."
-                    lineProblem -> "المشكلة في الخط أو شركة الإنترنت (الراوتر سليم)."
-                    sp in 0.0..10.0 -> "الواي فاي والراوتر سليمان، والسرعة منخفضة: سرعة الباقة أو الخط أو ازدحام الأجهزة."
-                    bloat -> "الخط يزدحم عند التحميل: قلّل الأجهزة أو فعّل QoS في الراوتر."
-                    else -> "لا توجد مشكلة واضحة."
+                c.outputStream.use { o ->
+                    while (sent < UL_CAP && System.nanoTime() < deadline && !cancelled.get()) {
+                        val n = Math.min(buf.size.toLong(), UL_CAP - sent).toInt()
+                        o.write(buf, 0, n); sent += n
+                    }
                 }
-
-                diagText = "📊 نتائج فحص الهاتف\n" +
-                    "إشارة: ${info.rssi}dBm | ${if (is24) "2.4" else "5"}GHz قناة $curCh | وصلة ${info.linkSpeed}Mbps\n" +
-                    "الراوتر: ${gwMs.toInt()}ms فقد $gwLoss%\n" +
-                    "الإنترنت: ${netMs.toInt()}ms تذبذب ${jitter.toInt()}ms فقد $netLoss%\n" +
-                    "السرعة: ${fmt(sp)} | زمن أثناء التحميل: ${if (loaded > 0) "${loaded.toInt()}ms" else "—"}\n" +
-                    dnsReport + "\n\n" +
-                    "🔎 الأسباب:\n" + causes.joinToString("\n")
-                setReport(diagText + "\n\n🎯 الخطة: قناة $bestCh + DNS $bestDns")
-                diagBusy = false
-                runOnUiThread { fixBtn.isEnabled = true; if (auto) { applyFixes() } else { startBtn.isEnabled = true } }
-            } catch (e: Exception) {
-                diagBusy = false
-                log("❌ خطأ أثناء الفحص: ${e.message} (تأكد من تفعيل الموقع وصلاحيات الواي فاي)")
-                setChip("● خطأ", cRed)
-                runOnUiThread { startBtn.isEnabled = true }
-            }
-        }
+                if (sent >= UL_CAP) c.responseCode
+            } catch (e: Exception) {}
+            end = System.nanoTime()
+            try { c.disconnect() } catch (e: Exception) {}
+        } catch (e: Exception) {}
+        dataUsed.addAndGet(sent)
+        chk()
+        val secs = (end - start) / 1e9
+        return if (sent > 0 && secs > 0) sent * 8 / secs / 1e6 else -1.0
     }
 
-    // ================= سكربت الراوتر (بحث ذكي + تمييز مرئي للعناصر) =================
-    private fun widParam(): String = if (restoring) restoreWid else if (crowded) "20" else ""
+    private fun gwAndNet(tag: String): Snap {
+        log("⏳ [$tag] فحص الاتصال بالراوتر والإنترنت...")
+        val rc = reach()
+        val (gwMs, gwLoss) = gwStats()
+        val ping = if (rc.internet) { log("⏳ [$tag] قياس الاستجابة (20 عينة)..."); pingStats(20) } else PingRes(-1.0, 0.0, 100, "لا يوجد إنترنت")
+        var sp = Speed(-1.0, -1.0, -1.0)
+        if (rc.tcp || rc.http) {
+            log("⏳ [$tag] اختبار التنزيل (حتى ${DL_CAP / 1_000_000}MB)...")
+            val (d, l) = speedRetry()
+            log("⏳ [$tag] اختبار الرفع (حتى ${UL_CAP / 1_000_000}MB)...")
+            val u = uploadTest()
+            sp = Speed(d, u, l)
+        }
+        return Snap(rc, gwMs, gwLoss, ping, sp)
+    }
 
+    // ================= قياس DNS (مهلة إجمالية + إلغاء غير المكتمل) =================
+    private fun dnsScore(server: String, deadline: Long): DnsRes? {
+        val times = mutableListOf<Long>()
+        var total = 0
+        var fails = 0
+        for (round in 1..3) {
+            for (d in testDomains) {
+                if (cancelled.get() || System.currentTimeMillis() > deadline) return null   // غير مكتمل ← يُهمل
+                val x = dnsQuery(server, d, 1000)
+                total++
+                if (x >= 0) times.add(x) else fails++
+                if (total == 6 && times.isEmpty()) return DnsRes(server, -1.0, -1.0, 0, 1e9)  // لا يستجيب
+            }
+        }
+        if (times.isEmpty()) return DnsRes(server, -1.0, -1.0, 0, 1e9)
+        val sorted = times.sorted()
+        val avg = times.average()
+        val med = sorted[sorted.size / 2].toDouble()
+        val sd = Math.sqrt(times.sumOf { (it - avg) * (it - avg) } / times.size)
+        val success = (total - fails) * 100 / total
+        val score = med * 0.5 + avg * 0.3 + sd * 0.2 + (100 - success) * 8.0
+        return DnsRes(server, avg, med, success, score)
+    }
+
+    private fun benchmarkDns(extra: List<String>): List<DnsRes> {
+        val all = (extra + ispDns() + dnsCandidates).filter { isIp(it) }.distinct()
+        val deadline = System.currentTimeMillis() + 25_000
+        val pool = Executors.newFixedThreadPool(4)
+        val futures = all.map { s -> pool.submit(Callable<DnsRes?> { dnsScore(s, deadline) }) }
+        val out = mutableListOf<DnsRes>()
+        try {
+            for (f in futures) {
+                if (cancelled.get()) break
+                val left = deadline - System.currentTimeMillis()
+                try {
+                    val r = f.get(Math.max(left, 100L), TimeUnit.MILLISECONDS)
+                    if (r != null) out.add(r)
+                } catch (e: Exception) { f.cancel(true) }
+            }
+        } finally { pool.shutdownNow() }
+        chk()
+        return out.sortedBy { it.score }
+    }
+
+    private fun chooseDns(ranked: List<DnsRes>, curServer: String) {
+        val good = ranked.filter { it.success >= 90 }
+        if (good.isEmpty()) { dnsWorth = false; dnsReport = "🧭 تعذّر قياس DNS بشكل موثوق (UDP/53 قد يكون محظوراً)"; return }
+        val cur = ranked.firstOrNull { it.server == curServer }
+        val best = good[0]
+        bestDns = best.server
+        bestDns2 = good.firstOrNull { it.server != best.server }?.server ?: ""
+        dnsWorth = isIp(best.server) && best.server != curServer &&
+            (cur == null || cur.success < 80 || (best.score < cur.score * 0.8 && cur.score - best.score >= 5))
+        dnsReport = "🧭 أفضل DNS: ${best.server} (${best.avg.toInt()}ms، نجاح ${best.success}%)" +
+            (if (cur != null) " | الحالي $curServer (${if (cur.avg < 0) "لا يستجيب" else "${cur.avg.toInt()}ms"}، نجاح ${cur.success}%)" else "") +
+            if (dnsWorth) " ← مرشّح للتغيير" else " ← الحالي مناسب"
+    }
+
+    private fun dnsRankText(): String {
+        if (dnsRank.isEmpty()) return "لم يتم القياس"
+        return dnsRank.take(11).mapIndexed { i, p ->
+            val name = (dnsNames[p.server] ?: "DNS آخر") + (if (p.server == curDnsAtStart) " (الحالي)" else "")
+            val mark = if (p.server == bestDns) " ⭐" else if (p.server == bestDns2) " ✔" else ""
+            val t = if (p.avg < 0) "لا يستجيب" else "${p.avg.toInt()}ms • نجاح ${p.success}%"
+            "${i + 1}. $name ${p.server} — $t$mark"
+        }.joinToString("\n")
+    }
+
+    private fun renderDns() { val t = dnsRankText(); runOnUiThread { if (!destroyed) dnsTv.text = t } }
+
+    // ================= مسح القنوات (2.4GHz، كل القنوات المتاحة) =================
+    private fun scanChannels(): ChanScan {
+        if (!hasLoc()) return ChanScan(false, 0, emptyMap(), "صلاحية الموقع غير ممنوحة")
+        if (Build.VERSION.SDK_INT >= 28) {
+            val lm = getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
+            if (!lm.isLocationEnabled) return ChanScan(false, 0, emptyMap(), "خدمة الموقع (GPS) مغلقة")
+        }
+        val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        val own = try { wm.connectionInfo.bssid } catch (e: Exception) { null }
+        val seen = HashMap<String, Int>()
+        val freq = HashMap<String, Int>()
+        var total = 0
+        try {
+            repeat(3) {
+                chk()
+                try { wm.startScan() } catch (e: Exception) {}
+                sleepC(3000)
+                val res = wm.scanResults
+                total = Math.max(total, res.size)
+                res.filter { it.frequency in 2400..2500 && it.BSSID != own }.forEach {
+                    if (it.level > (seen[it.BSSID] ?: -200)) { seen[it.BSSID] = it.level; freq[it.BSSID] = it.frequency }
+                }
+            }
+        } catch (e: SecurityException) {
+            return ChanScan(false, 0, emptyMap(), "رفض النظام نتائج المسح")
+        }
+        if (total == 0) return ChanScan(false, 0, emptyMap(), "نتائج المسح فارغة (قد يكون النظام قيّد المسح)")
+        fun load(ch: Int): Double = seen.entries.sumOf { e ->
+            val apCh = if (freq[e.key] == 2484) 14 else (freq[e.key]!! - 2407) / 5
+            val d = Math.abs(apCh - ch)
+            if (d > 4) 0.0 else Math.pow(10.0, e.value / 10.0) * (5 - d) / 5.0
+        }
+        val loads = (1..14).associateWith { load(it) }
+        return ChanScan(true, seen.size, loads, "")
+    }
+
+    /** أفضل قناة من القنوات التي يدعمها الراوتر فعلاً (مقروءة من صفحته). */
+    private fun chooseChannel(): Int? {
+        if (!rChOk || !scan.ok) return null
+        val cands = rChOpts.filter { it in 1..14 }
+        if (cands.isEmpty()) return null
+        val min = cands.minOf { scan.loads[it] ?: 0.0 }
+        val near = cands.filter { (scan.loads[it] ?: 0.0) <= min * 1.05 + 1e-18 }
+        return near.firstOrNull { it == 1 || it == 6 || it == 11 } ?: near.first()
+    }
+
+    // ================= سكربت الراوتر =================
     private fun q(s: String): String = JSONObject.quote(s)
 
-    private fun js(ph: String): String {
-        val user = userEt.text.toString()
-        val pass = if (loginTries < 2) passEt.text.toString() else ""
+    private fun routerJs(ph: String, write: Boolean = false, ch: Int = 0, d1: String = "", d2: String = "", wid: String = ""): String {
+        val pass = if (loginTries < 3) credPass else ""
+        val wr = if (write) "true" else "false"
         return """
-    (function(PH,CH,DNS,DNS2,DOCHG,WID,PT,USER,PASS){
-      var r={found:false,changed:false,pw:false,clicked:false,w:false,info:'',info2:'',cn:-1,wd:'',md:'',dbg:''};
+    (function(PH,WR,CH,DNS,DNS2,WID,PT,USER,PASS){
+      var r={found:false,changed:false,saved:false,pw:false,clicked:false,w:false,info:'',info2:'',cn:-1,wd:'',md:'',opts:'[]',wopts:'[]',hasAuto:false,dbg:''};
       function docs(w,a){a.push(w.document);for(var i=0;i<w.frames.length;i++){try{docs(w.frames[i],a)}catch(e){}}return a}
       function vis(e){return e.offsetParent!==null}
       function hl(e){try{e.style.outline='3px solid #22d3ee';e.style.backgroundColor='#fef9c3';e.scrollIntoView({block:'center'})}catch(x){}}
@@ -965,9 +1117,10 @@ class MainActivity : Activity() {
       function ok(a,n){return a===n||(n.length>4&&a.indexOf(n)===0&&a.length<=n.length+10)}
       function num(o){var m=(o.text||'').match(/^\s*(?:channel\s*)?(\d{1,2})\b/i);if(m)return parseInt(m[1]);
         var v=(o.value||'');return /^\d{1,2}\b/.test(v)?parseInt(v):-1}
-      function save(d){var nm=['save','apply','ok','submit','save changes','apply changes','confirm','حفظ','تطبيق','تأكيد'];
+      function findSave(d){var nm=['save','apply','ok','submit','save changes','apply changes','confirm','حفظ','تطبيق','تأكيد'];
         var c=[].slice.call(d.querySelectorAll('button,input[type=button],input[type=submit],a')).filter(vis);
-        for(var i=0;i<c.length;i++){if(nm.indexOf(norm(c[i]))>=0){c[i].click();return true}}return false}
+        for(var i=0;i<c.length;i++){if(nm.indexOf(norm(c[i]))>=0){return c[i]}}return null}
+      function doSave(d){var b=findSave(d);if(b){r.saved=true;setTimeout(function(){b.click()},700)}}
       function menu(names){var ds=docs(window,[]);
         for(var k=0;k<names.length;k++){var n=names[(PT+k)%names.length];
           for(var j=0;j<ds.length;j++){
@@ -999,7 +1152,7 @@ class MainActivity : Activity() {
           var dn=[].slice.call(d.querySelectorAll('input')).filter(function(x){
             return vis(x)&&!x.disabled&&!x.readOnly&&x.type!=='hidden'&&x.type!=='checkbox'&&x.type!=='radio'&&/dns/i.test(x.name+x.id+(x.placeholder||''))});
           if(dn.length){r.found=true;r.info=dn[0].value.trim();r.info2=dn[1]?dn[1].value.trim():'';hl(dn[0]);if(dn[1])hl(dn[1]);
-            if(DOCHG&&r.info!==DNS){setv(dn[0],DNS);if(dn[1])setv(dn[1],DNS2);setTimeout(function(){save(d)},700);r.changed=true}
+            if(WR&&(r.info!==DNS||(dn[1]&&r.info2!==DNS2))){setv(dn[0],DNS);if(dn[1])setv(dn[1],DNS2);r.changed=true;doSave(d)}
             return r}
         } else if(PH==='clients'){
           if(/mac/i.test(tx)&&/client|device|host|station|connected|assigned|جهاز/i.test(tx)){
@@ -1014,22 +1167,29 @@ class MainActivity : Activity() {
             else if(j.indexOf('20')>=0&&j.indexOf('40')>=0)ws=s;
             else if(/11b|11g|11n|bgn/.test(j))ms=s});
           if(cs){r.found=true;var co=cs.options[cs.selectedIndex];r.info=co.text.trim();r.cn=num(co);
+            var cso=[].slice.call(cs.options);
+            r.opts=JSON.stringify(cso.map(num).filter(function(n){return n>0}));
+            r.hasAuto=cso.some(function(x){return /auto/i.test(x.text)});
             r.wd=ws?ws.options[ws.selectedIndex].text.trim():'';r.md=ms?ms.options[ms.selectedIndex].text.trim():'';
-            var chg=false,tq=-1;hl(cs);
-            for(var q=0;q<cs.options.length;q++){
-              if(CH===0){if(/auto/i.test(cs.options[q].text)){tq=q;break}}
-              else if(num(cs.options[q])===CH){tq=q;break}}
-            if(tq>=0&&tq!==cs.selectedIndex){cs.selectedIndex=tq;cs.dispatchEvent(new Event('change',{bubbles:true}));chg=true}
-            if(WID&&ws){for(var q=0;q<ws.options.length;q++){
-              var tt=ws.options[q].text.trim();var t2=tt.replace(/\s/g,'').toLowerCase();
-              var hit=(WID==='20')?(t2==='20'||t2==='20mhz'):(tt===WID);
-              if(hit){hl(ws);if(ws.selectedIndex!==q){ws.selectedIndex=q;ws.dispatchEvent(new Event('change',{bubbles:true}));chg=true;r.w=true}break}}}
-            if(chg){setTimeout(function(){save(d)},700);r.changed=true}
+            r.wopts=ws?JSON.stringify([].slice.call(ws.options).map(function(x){return x.text.trim()})):'[]';
+            hl(cs);
+            if(WR){
+              var chg=false,tq=-1;
+              for(var q=0;q<cs.options.length;q++){
+                if(CH===0){if(/auto/i.test(cs.options[q].text)){tq=q;break}}
+                else if(num(cs.options[q])===CH){tq=q;break}}
+              if(tq>=0&&tq!==cs.selectedIndex){cs.selectedIndex=tq;cs.dispatchEvent(new Event('change',{bubbles:true}));chg=true}
+              if(WID&&ws){for(var q=0;q<ws.options.length;q++){
+                var tt=ws.options[q].text.trim();var t2=tt.replace(/\s/g,'').toLowerCase();
+                var hit=(WID==='20')?(t2==='20'||t2==='20mhz'):(tt===WID);
+                if(hit){hl(ws);if(ws.selectedIndex!==q){ws.selectedIndex=q;ws.dispatchEvent(new Event('change',{bubbles:true}));chg=true;r.w=true}break}}}
+              if(chg){r.changed=true;doSave(d)}
+            }
             return r}
         } else if(PH==='reboot'){
           var rn=['reboot','restart','reboot router','restart router','reboot now','restart now','إعادة تشغيل','اعادة تشغيل','إعادة التشغيل'];
           var cands=[].slice.call(d.querySelectorAll('input[type=button],input[type=submit],button,a,span,div,td,li')).filter(function(x){return vis(x)&&x.children.length<=1&&rn.indexOf(norm(x))>=0});
-          var bt=cands.filter(function(x){return /^(button|input)$/i.test(x.tagName)})[0];
+          var bt=cands.filter(function(x){return /^(button|input)${'$'}/i.test(x.tagName)})[0];
           if(!bt){bt=cands.filter(function(x){return /btn|button/i.test(x.className+'')||x.getAttribute('role')==='button'})[0]}
           if(!bt&&PT>=8&&cands.length){bt=cands[cands.length-1]}
           if(bt){hl(bt);setTimeout(function(){bt.click()},700);r.clicked=true;return r}
@@ -1042,16 +1202,17 @@ class MainActivity : Activity() {
       else if(PH==='chan')menu(['wireless settings','wireless','wi-fi','wifi','wlan settings','wlan','2.4g wireless','basic settings']);
       else if(PH==='reboot')menu(['reboot','restart','system tools','system','maintenance','management','administration','tools']);
       return r
-    })(${q(ph)},${bestCh},${q(bestDns)},${q(bestDns2)},$dnsWorth,${q(widParam())},$pt,${q(user)},${q(pass)})
+    })(${q(ph)},$wr,$ch,${q(d1)},${q(d2)},${q(wid)},$pt,${q(credUser)},${q(pass)})
     """
     }
 
-    // نوافذ التأكيد المخصصة (HTML) بعد الضغط على Reboot
+    // نوافذ التأكيد المخصصة (HTML) بعد الضغط على Reboot: تُنقر فقط داخل عناصر تشبه النوافذ المنبثقة
     private val confirmJs = """
     (function(){function docs(w,a){a.push(w.document);for(var i=0;i<w.frames.length;i++){try{docs(w.frames[i],a)}catch(e){}}return a}
+    function inModal(x){var p=x;for(var i=0;i<8&&p;i++){if(/modal|dialog|popup|confirm|msgbox|layer|alert/i.test((p.className||'')+' '+(p.id||'')))return true;p=p.parentElement}return false}
     var ok=['ok','yes','confirm','continue','نعم','موافق','تأكيد','reboot','restart'];
     docs(window,[]).forEach(function(d){try{var c=[].slice.call(d.querySelectorAll('button,input[type=button],input[type=submit],a,span,div')).filter(function(x){
-      return x.offsetParent!==null&&x.children.length<=1&&ok.indexOf((x.innerText||x.value||'').trim().toLowerCase())>=0});
+      return x.offsetParent!==null&&x.children.length<=1&&ok.indexOf((x.innerText||x.value||'').trim().toLowerCase())>=0&&inModal(x)});
       if(c.length){c[c.length-1].click()}}catch(e){}})})()
     """
 
@@ -1061,63 +1222,418 @@ class MainActivity : Activity() {
     var t=(x.innerText||x.value||x.id||'').trim();if(t.length<25&&/log\s*out|sign\s*out|logout|خروج/i.test(t)&&x.children.length<3){x.click()}})}catch(e){}})})()
     """
 
-    // ================= تسلسل الفحص والإصلاح =================
-    private fun openRouter() {
-        web.webViewClient = object : WebViewClient() {
-            override fun onReceivedHttpAuthRequest(v: WebView, h: HttpAuthHandler, hs: String, r: String) {
-                val u0 = userEt.text.toString(); val p0 = passEt.text.toString()
-                if (u0.isNotEmpty() && p0.isNotEmpty() && loginTries < 2) {
-                    loginTries++; h.proceed(u0, p0); return
-                }
-                val box = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 20, 40, 0) }
-                val u = EditText(this@MainActivity).apply { hint = "اسم المستخدم" }
-                val p = EditText(this@MainActivity).apply { hint = "كلمة المرور"; inputType = 129 }
-                box.addView(u); box.addView(p)
-                AlertDialog.Builder(this@MainActivity).setTitle("دخول الراوتر").setView(box)
-                    .setPositiveButton("دخول") { _, _ -> h.proceed(u.text.toString(), p.text.toString()) }
-                    .setNegativeButton("إلغاء") { _, _ -> h.cancel() }.show()
+    // ================= WebView =================
+    private val routerClient = object : WebViewClient() {
+        override fun onReceivedHttpAuthRequest(v: WebView, h: HttpAuthHandler, hs: String, r: String) {
+            if (credUser.isNotEmpty() && credPass.isNotEmpty() && authTries < 2) {
+                authTries++; h.proceed(credUser, credPass); return
             }
+            if (destroyed) { h.cancel(); return }
+            val box = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 20, 40, 0) }
+            val u = EditText(this@MainActivity).apply { hint = "اسم المستخدم" }
+            val p = EditText(this@MainActivity).apply { hint = "كلمة المرور"; inputType = 129 }
+            box.addView(u); box.addView(p)
+            AlertDialog.Builder(this@MainActivity).setTitle("دخول الراوتر").setView(box)
+                .setPositiveButton("دخول") { _, _ -> h.proceed(u.text.toString(), p.text.toString()) }
+                .setNegativeButton("إلغاء") { _, _ -> h.cancel() }.show()
         }
-        web.loadUrl("http://" + ip.text.toString().trim())
+
+        // شهادة الراوتر الذاتية: تُقبل فقط لعنوان الراوتر نفسه
+        override fun onReceivedSslError(v: WebView, h: SslErrorHandler, e: SslError) {
+            val u = e.url ?: ""
+            if (gwIp.isNotEmpty() && u.contains(gwIp)) h.proceed() else h.cancel()
+        }
+
+        override fun onReceivedError(v: WebView, req: WebResourceRequest, err: WebResourceError) {
+            if (req.isForMainFrame) log("⚠ تعذّر تحميل صفحة الراوتر: ${err.description}")
+        }
+
+        // منع أي رابط إعادة ضبط المصنع نهائياً
+        override fun shouldOverrideUrlLoading(v: WebView, req: WebResourceRequest): Boolean {
+            val u = req.url.toString()
+            if (Regex("factory|restoredefault|restore_default|resetdefault|reset_default", RegexOption.IGNORE_CASE).containsMatchIn(u)) {
+                log("🛑 منعتُ فتح رابط إعادة ضبط المصنع")
+                return true
+            }
+            return false
+        }
+
+        override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
+            webDead.set(true); log("❌ توقّفت عملية WebView"); return true
+        }
     }
 
-    private fun applyFixes() {
-        if (running) return
-        running = true; phase = "status"; ticks = 0; pt = 0; changed = false; oldUptime = false; devices = -1
-        dnsDone = false; chanDone = false; loginTries = 0; rebootTry = 0
-        rebootOk = false; rebootPlanned = false; loggedOut = false
+    private fun openRouter() {
+        runOnUiThread {
+            if (destroyed) return@runOnUiThread
+            authTries = 0
+            web.webViewClient = routerClient
+            web.loadUrl("http://$gwIp")
+        }
+        sleepC(2500)
+    }
+
+    /** تنفيذ سكربت في WebView وانتظار نتيجته (بدون حجب الواجهة). */
+    private fun evalJs(script: String, timeoutMs: Long = 8000): JSONObject? {
+        chk()
+        val latch = CountDownLatch(1)
+        var out: String? = null
+        runOnUiThread {
+            if (destroyed) { latch.countDown(); return@runOnUiThread }
+            try { web.evaluateJavascript(script) { v -> out = v; latch.countDown() } } catch (e: Exception) { latch.countDown() }
+        }
+        latch.await(timeoutMs, TimeUnit.MILLISECONDS)
+        val s = out ?: return null
+        return try { JSONObject(s) } catch (e: Exception) { null }
+    }
+
+    /** يتنقل في قوائم الراوتر ويقرأ/يكتب حتى يتحقق الشرط، أو ينتهي العدد. */
+    private fun navRead(
+        ph: String, maxTicks: Int, write: Boolean = false, ch: Int = 0, d1: String = "", d2: String = "", wid: String = "",
+        until: (JSONObject) -> Boolean = { it.optBoolean("found") }
+    ): JSONObject? {
+        pt = 0
+        var pwSeen = 0
+        for (tick in 1..maxTicks) {
+            chk()
+            if (webDead.get()) throw IllegalStateException("توقّف WebView")
+            val r = evalJs(routerJs(ph, write, ch, d1, d2, wid))
+            if (r != null) {
+                if (r.optBoolean("pw")) {
+                    pwSeen++
+                    if (credPass.isNotEmpty() && loginTries < 3) { loginTries++; log("🔐 أسجّل الدخول تلقائياً... ($loginTries)") }
+                    else if (credPass.isEmpty()) log("✍ سجّل دخولك في صفحة الراوتر بالأسفل وسأكمل تلقائياً")
+                    else log("⏳ أنتظر نتيجة تسجيل الدخول...")
+                    if (credPass.isNotEmpty() && loginTries >= 3 && pwSeen > 8) { loginStuck = true; return null }
+                } else {
+                    if (until(r)) { loginStuck = false; loginTries = 0; return r }
+                    pt++
+                    if (pt % 6 == 1) log(when (ph) {
+                        "status" -> "🔎 أفتح صفحة حالة الراوتر..."
+                        "dns" -> "🔎 أبحث عن إعدادات DNS..."
+                        "clients" -> "🔎 أقرأ الأجهزة المتصلة..."
+                        "chan" -> "🔎 أبحث عن إعدادات القناة..."
+                        else -> "🔁 أبحث عن زر إعادة التشغيل..."
+                    })
+                    if (ph == "reboot" && pt == 12) log("🧩 العناصر الظاهرة: ${r.optString("dbg").take(350)}")
+                }
+            }
+            sleepC(2500)
+        }
+        loginStuck = pwSeen >= 3
+        return null
+    }
+
+    // ================= النسخة الاحتياطية (مع التحقق من صحتها) =================
+    private fun loadBackup(): JSONObject? = try {
+        val s = getSharedPreferences("nf", 0).getString("bk", null)
+        if (s == null) null else JSONObject(s)
+    } catch (e: Exception) { null }
+
+    private fun hasBackup() = loadBackup() != null
+
+    private fun validateBackup(b: JSONObject): Boolean {
+        if (b.optInt("v") != 1 || b.optString("gw").isEmpty()) return false
+        if (b.optBoolean("hasDns")) {
+            val a = b.optString("dns1"); val c = b.optString("dns2")
+            if (!(a.isEmpty() || isIp(a)) || !(c.isEmpty() || isIp(c))) return false
+        }
+        if (b.optBoolean("hasChan")) { if (b.optInt("ch", -1) !in 0..14) return false }
+        return b.optBoolean("hasDns") || b.optBoolean("hasChan")
+    }
+
+    /** يحفظ الأصل قبل أي تعديل. لا يكتب فوق الأصل إذا كانت القيم الحالية هي نتيجة تعديلنا السابق. */
+    private fun saveBackup(): Boolean {
+        val sp = getSharedPreferences("nf", 0)
+        val old = loadBackup()
+        val curCh = if (rCh > 0) rCh else 0
+        if (old != null && old.optString("gw") == gwIp && validateBackup(old)) {
+            val sameAsOurs = (!old.optBoolean("hasDns") || old.optString("aDns1").isEmpty() || old.optString("aDns1") == rDns1) &&
+                (!old.optBoolean("hasChan") || old.optInt("aCh", -2) == -2 || old.optInt("aCh") == curCh)
+            val sameAsOriginal = (!old.optBoolean("hasDns") || old.optString("dns1") == rDns1) &&
+                (!old.optBoolean("hasChan") || old.optInt("ch") == curCh)
+            if (sameAsOurs || sameAsOriginal) return true   // نحتفظ بالأصل القديم
+        }
+        val b = JSONObject().apply {
+            put("v", 1); put("gw", gwIp); put("vendor", vendor); put("ts", System.currentTimeMillis())
+            put("hasDns", rDnsOk); put("dns1", rDns1); put("dns2", rDns2)
+            put("hasChan", rChOk); put("ch", curCh); put("wd", rWd)
+            put("aDns1", ""); put("aCh", -2)
+        }
+        if (!validateBackup(b)) return false
+        sp.edit().putString("bk", b.toString()).commit()
+        val back = loadBackup()
+        return back != null && validateBackup(back) && back.optString("dns1") == rDns1
+    }
+
+    private fun markApplied(dns1: String?, ch: Int?) {
+        val b = loadBackup() ?: return
+        if (dns1 != null) b.put("aDns1", dns1)
+        if (ch != null) b.put("aCh", ch)
+        getSharedPreferences("nf", 0).edit().putString("bk", b.toString()).commit()
+    }
+
+    // ================= التطبيق مع التحقق الفعلي بعد الحفظ =================
+    private fun normW(s: String) = s.replace(" ", "").lowercase(Locale.ROOT)
+
+    /** إعادة تحميل كاملة لصفحة الراوتر ثم قراءة DNS من جديد (لا يُعتمد على القيم المكتوبة في النموذج). */
+    private fun verifyDns(d1: String, d2: String): Boolean {
+        openRouter()
+        val r = navRead("dns", 30) ?: return false
+        val a = r.optString("info"); val b = r.optString("info2")
+        return a == d1 && (b.isEmpty() || d2.isEmpty() || b == d2 || !r.has("info2"))
+    }
+
+    private fun verifyChan(ch: Int, wid: String): Boolean {
+        openRouter()
+        val r = navRead("chan", 30) ?: return false
+        val cn = r.optInt("cn", -1)
+        val chOk = if (ch == 0) (cn <= 0 && Regex("auto", RegexOption.IGNORE_CASE).containsMatchIn(r.optString("info"))) else cn == ch
+        val wOk = wid.isEmpty() || (if (wid == "20") normW(r.optString("wd")).let { it == "20" || it == "20mhz" } else r.optString("wd") == wid)
+        return chOk && wOk
+    }
+
+    private fun applyDnsValue(d1: String, d2: String, tag: String): Boolean {
+        val r = navRead("dns", 30, write = true, d1 = d1, d2 = d2)
+        if (r == null) { failList += "DNS ($tag): لم أجد حقول DNS قابلة للتعديل في واجهة الراوتر"; return false }
+        if (r.optBoolean("changed") && !r.optBoolean("saved")) {
+            failList += "DNS ($tag): لم أجد زر الحفظ في صفحة الراوتر، لم يُحفظ شيء"; return false
+        }
+        if (r.optBoolean("changed")) { log("💾 ضغطتُ حفظ DNS، أنتظر التطبيق..."); sleepC(6000); waitRouterBack(90_000) }
+        log("🔍 أتحقق من قيمة DNS بعد الحفظ (إعادة تحميل الصفحة)...")
+        return verifyDns(d1, d2)
+    }
+
+    private fun applyChanValue(ch: Int, wid: String, tag: String): Boolean {
+        val r = navRead("chan", 30, write = true, ch = ch, wid = wid)
+        if (r == null) { failList += "القناة ($tag): لم أجد إعدادات القناة في واجهة الراوتر"; return false }
+        if (r.optBoolean("changed") && !r.optBoolean("saved")) {
+            failList += "القناة ($tag): لم أجد زر الحفظ، لم يُحفظ شيء"; return false
+        }
+        if (r.optBoolean("changed")) { log("💾 ضغطتُ حفظ القناة (قد ينقطع الواي فاي لثوانٍ)..."); sleepC(10_000); waitRouterBack(150_000) }
+        log("🔍 أتحقق من القناة بعد الحفظ (إعادة تحميل الصفحة)...")
+        return verifyChan(ch, wid)
+    }
+
+    // ================= انتظار الراوتر الصحيح والإنترنت (مرحلة مستقلة) =================
+    private fun fetchTitle(): String = try {
+        val c = URL("http://$gwIp/").openConnection() as HttpURLConnection
+        c.connectTimeout = 2500; c.readTimeout = 2500; c.instanceFollowRedirects = true
+        val txt = c.inputStream.use { s -> String(s.readBytes().take(8192).toByteArray(), Charsets.ISO_8859_1) }
+        c.disconnect()
+        Regex("<title[^>]*>([^<]{0,80})", RegexOption.IGNORE_CASE).find(txt)?.groupValues?.get(1)?.trim()?.lowercase(Locale.ROOT) ?: ""
+    } catch (e: Exception) { "" }
+
+    /** ينتظر عودة الراوتر المطلوب تحديداً (نفس الشبكة + نفس البوابة + نفس بصمة الصفحة) باستقرار متتالٍ. */
+    private fun waitRouterBack(timeoutMs: Long): Boolean {
+        val t0 = System.currentTimeMillis()
+        var good = 0
+        var lastNote = -100L
+        while (System.currentTimeMillis() - t0 < timeoutMs) {
+            chk(); bindToWifi()
+            val net = onTargetNetwork()
+            if (net && tcpAny(gwIp) >= 0) {
+                val t = if (lockTitle.isNotEmpty()) fetchTitle() else ""
+                if (lockTitle.isEmpty() || t.isEmpty() || t == lockTitle) good++
+                else { good = 0; log("⚠ الصفحة التي ردّت ليست صفحة الراوتر المطلوب") }
+                if (good >= 2) return true
+            } else {
+                good = 0   // انقطاع مؤقت لا يُعدّ فشلاً، فقط نبدأ العدّ من جديد
+                val el = (System.currentTimeMillis() - t0) / 1000
+                if (el - lastNote >= 15) {
+                    lastNote = el
+                    log(if (!net) "⏳ أنتظر اتصال الهاتف بشبكة الراوتر الأصلية... (${el}ث)" else "⏳ أنتظر رجوع صفحة الراوتر... (${el}ث)")
+                    nudgeWifi()
+                }
+                if (el in 100L..115L) log("📶 لو الواي فاي لم يتصل تلقائياً، اتصل بشبكتك يدوياً وسأكمل")
+            }
+            sleepC(3000)
+        }
+        return false
+    }
+
+    /** ينتظر الإنترنت بشكل مستقل عن صفحة الراوتر (3 نجاحات متتالية). */
+    private fun waitInternet(timeoutMs: Long): Boolean {
+        val t0 = System.currentTimeMillis()
+        var good = 0
+        var n = 0
+        while (System.currentTimeMillis() - t0 < timeoutMs) {
+            chk(); bindToWifi()
+            val rc = reach()
+            if (rc.internet) good++ else good = 0
+            if (good >= 3) { log("🌐 الإنترنت مستقر"); return true }
+            if (good == 0 && n % 4 == 0) log("⏳ أنتظر عودة الإنترنت...")
+            n++
+            sleepC(3000)
+        }
+        return false
+    }
+
+    // ================= حفظ المرحلة (لاستكمال العملية دون البدء من الصفر) =================
+    private fun jsonList(a: JSONArray?): List<String> {
+        val out = mutableListOf<String>()
+        if (a != null) for (i in 0 until a.length()) out.add(a.optString(i))
+        return out
+    }
+
+    private fun saveStage(stage: String) {
+        try {
+            val o = JSONObject().apply {
+                put("stage", stage); put("ts", System.currentTimeMillis())
+                put("gw", gwIp); put("ssid", lockSsid); put("bssid", lockBssid); put("title", lockTitle); put("vendor", vendor)
+                put("bDown", bDown); put("bUp", bUp); put("bLoaded", bLoaded); put("gwb", gwBefore)
+                put("pb", JSONArray(listOf(pingB.avg, pingB.jitter, pingB.loss.toDouble())))
+                put("pbm", pingB.method); put("sb", scoreB)
+                put("ok", JSONArray(okList as Collection<*>)); put("fail", JSONArray(failList as Collection<*>))
+                put("skip", JSONArray(skipList as Collection<*>)); put("audit", JSONArray(audit as Collection<*>))
+                put("diag", diagText); put("primary", primary); put("rank", dnsRankText())
+                put("planned", plannedCount); put("verified", verifiedCount); put("devices", devices)
+                put("lowSpeed", lowSpeed); put("lineProblem", lineProblem)
+            }
+            getSharedPreferences("nf", 0).edit().putString("stage", o.toString()).commit()
+        } catch (e: Exception) {}
+    }
+
+    private fun clearStage() { getSharedPreferences("nf", 0).edit().remove("stage").commit() }
+
+    private fun loadStage(o: JSONObject) {
+        gwIp = o.optString("gw", gwIp); lockSsid = o.optString("ssid"); lockBssid = o.optString("bssid")
+        lockTitle = o.optString("title"); vendor = o.optString("vendor")
+        bDown = o.optDouble("bDown", -1.0); bUp = o.optDouble("bUp", -1.0); bLoaded = o.optDouble("bLoaded", -1.0)
+        gwBefore = o.optDouble("gwb", -1.0)
+        val p = o.optJSONArray("pb")
+        pingB = PingRes(p?.optDouble(0, -1.0) ?: -1.0, p?.optDouble(1, 0.0) ?: 0.0, (p?.optDouble(2, 100.0) ?: 100.0).toInt(), o.optString("pbm"))
+        scoreB = o.optInt("sb")
+        okList.clear(); okList.addAll(jsonList(o.optJSONArray("ok")))
+        failList.clear(); failList.addAll(jsonList(o.optJSONArray("fail")))
+        skipList.clear(); skipList.addAll(jsonList(o.optJSONArray("skip")))
+        audit.clear(); audit.addAll(jsonList(o.optJSONArray("audit")))
+        diagText = o.optString("diag"); primary = o.optString("primary")
+        savedRank = o.optString("rank")
+        plannedCount = o.optInt("planned"); verifiedCount = o.optInt("verified"); devices = o.optInt("devices", -1)
+        lowSpeed = o.optBoolean("lowSpeed"); lineProblem = o.optBoolean("lineProblem")
+    }
+    private var savedRank = ""
+
+    private fun checkResume() {
+        val s = getSharedPreferences("nf", 0).getString("stage", null) ?: return
+        val o = try { JSONObject(s) } catch (e: Exception) { clearStage(); return }
+        if (System.currentTimeMillis() - o.optLong("ts") > STAGE_TTL) { clearStage(); return }
+        AlertDialog.Builder(this).setTitle("عملية سابقة لم تكتمل")
+            .setMessage("توجد عملية إعادة تشغيل لم يكتمل قياس نتيجتها. أستكملها (انتظار الراوتر والإنترنت ثم القياس) بدل البدء من الصفر؟")
+            .setPositiveButton("استكمال") { _, _ ->
+                ip.setText(o.optString("gw")); wizard.visibility = View.GONE
+                startRun(false, o)
+            }
+            .setNegativeButton("تجاهل") { _, _ -> clearStage() }.show()
+    }
+
+    // ================= التشغيل =================
+    private fun resetState() {
+        okList.clear(); failList.clear(); skipList.clear(); audit.clear()
+        rDnsOk = false; rDns1 = ""; rDns2 = ""; rChOk = false; rCh = -1; rWd = ""; rMd = ""
+        rChOpts = emptyList(); rWopts = emptyList(); devices = -1; oldUptime = false
+        bestDns = ""; bestDns2 = ""; dnsWorth = false; dnsReport = ""; dnsRank = emptyList(); curDnsAtStart = ""; savedRank = ""
+        scan = ChanScan(false, 0, emptyMap(), "")
+        bDown = -1.0; bUp = -1.0; bLoaded = -1.0; aDown = -1.0; aUp = -1.0
+        pingB = PingRes(-1.0, 0.0, 100, "none"); pingA = null
+        gwBefore = -1.0; gwAfter = -1.0; scoreB = 0; scoreA = 0; afterValid = false
+        lowSpeed = false; lineProblem = false; primary = ""; diagText = ""
+        plannedCount = 0; verifiedCount = 0; rebootPlanned = false; rebootOk = false; loggedOut = false; changedAny = false
+        unknownUi = false; vendor = ""; loginTries = 0; loginStuck = false; pt = 0
+        lockSsid = ""; lockBssid = ""; lockTitle = ""
+        webDead.set(false)
+    }
+
+    private fun startRun(restore: Boolean, resume: JSONObject? = null) {
+        if (busy) return
+        busy = true
+        cancelled.set(false); approved.set(false); dataUsed.set(0)
+        restoring = restore
+        credUser = userEt.text.toString(); credPass = passEt.text.toString()
         gwIp = ip.text.toString().trim()
-        report.clear(); audit.clear()
+        resetState()
+        resetUi()
         setChip("● جارٍ العمل", cAmber)
-        runOnUiThread { startBtn.isEnabled = false }
-        setStep(3, 1)
-        log(if (passEt.text.isNotEmpty()) "🔐 سأسجّل الدخول تلقائياً ثم أبدأ الضبط" else "✍ سجّل دخولك في صفحة الراوتر بالأسفل وسأكمل تلقائياً")
-        ui.postDelayed({ step() }, 2000)
+        runOnUiThread {
+            startBtn.isEnabled = false; fixBtn.isEnabled = false; restoreBtn.isEnabled = false
+            stopBtn.visibility = View.VISIBLE
+        }
+        thread(name = "netfix-run") { runner(resume) }
     }
 
-    private fun moveTo(p: String) {
-        phase = p; pt = 0; loginTries = 0
-        when (p) {
-            "dns" -> { setStep(3, 2); setStep(4, 1) }
-            "clients" -> setStep(4, if (dnsDone) 2 else 3)
-            "chan" -> setStep(5, 1)
-            "reboot" -> { rebootPlanned = true; setStep(5, if (chanDone) 2 else 3); setStep(6, 1) }
-            "done" -> { setStep(5, if (chanDone) 2 else 3); setStep(6, 3) }
+    private fun runner(resume: JSONObject?) {
+        try {
+            bindToWifi()
+            when {
+                resume != null -> resumePost(resume)
+                restoring -> doRestore()
+                else -> mainFlow()
+            }
+        } catch (c: Cancelled) {
+            cancelledEnd()
+        } catch (e: Exception) {
+            log("❌ خطأ غير متوقع: ${e.message}")
+            failList += "خطأ غير متوقع: ${e.message}"
+            setChip("● خطأ", cRed)
+            clearStage()
+            setReport("❌ توقّفت العملية بسبب خطأ: ${e.message}\n\n" + resultLists())
+            endRun()
         }
     }
 
-    private fun nextPhase() {
-        val i = order.indexOf(phase)
-        if (i >= 0 && i < order.size - 1) moveTo(order[i + 1])
-        else {
-            val needReboot = changed || (!restoring && (oldUptime || (lowSpeed && !lineProblem)))
-            moveTo(if (needReboot) "reboot" else "done")
+    private fun cancelledEnd() {
+        log("⛔ تم إيقاف العملية بطلبك")
+        clearStage()
+        try { doLogout() } catch (e: Throwable) {}
+        setChip("● متوقف", cAmber)
+        setReport("⛔ تم إيقاف العملية بطلبك.\n\n" + resultLists())
+        endRun()
+    }
+
+    private fun endRun() {
+        busy = false; restoring = false
+        runOnUiThread {
+            if (destroyed) return@runOnUiThread
+            restoreBtn.isEnabled = hasBackup(); startBtn.isEnabled = true; fixBtn.isEnabled = true
+            stopBtn.visibility = View.GONE
+        }
+    }
+
+    private fun loginFailed(msg: String) {
+        setStep(3, 4)
+        setChip("● تعذّر الدخول", cRed)
+        log("❌ $msg")
+        failList += msg
+        clearStage()
+        endRun()
+        showWizard(2, "❌ $msg")
+    }
+
+    private fun resultLists(): String {
+        val sb = StringBuilder()
+        if (okList.isNotEmpty()) sb.append("✅ تغييرات تم التحقق منها:\n").append(okList.joinToString("\n") { "• $it" }).append("\n\n")
+        if (failList.isNotEmpty()) sb.append("❌ فشلت (مع السبب):\n").append(failList.joinToString("\n") { "• $it" }).append("\n\n")
+        if (skipList.isNotEmpty()) sb.append("⏭ تم تخطّيها:\n").append(skipList.joinToString("\n") { "• $it" }).append("\n\n")
+        if (sb.isEmpty()) sb.append("لم يتم تنفيذ أي تغيير.\n\n")
+        return sb.toString()
+    }
+
+    // ================= التدفق الرئيسي =================
+    private fun captureIdentity() {
+        val (ss, bs, _) = wifiInfoSafe()
+        lockSsid = ss; lockBssid = bs
+        lockTitle = fetchTitle()
+        if (lockSsid.isNotEmpty()) audit += "📶 الشبكة: $lockSsid"
+        if (!onTargetNetwork()) {
+            log("⚠ لا أتأكد أن الهاتف متصل بواي فاي الراوتر $gwIp")
+            audit += "⚠ لم أتأكد أن الهاتف على شبكة هذا الراوتر (الاتصال بواي فاي أو العنوان قد يكون خاطئاً)"
         }
     }
 
     private fun parseStatus(s: String) {
         val o = try { JSONObject(s) } catch (e: Exception) { return }
-        val vendor = o.optString("vendor")
+        vendor = o.optString("vendor")
         if (vendor.isNotEmpty()) { audit += "🏷 نوع الراوتر: $vendor"; log("🏷 تم التعرّف على الراوتر: $vendor") }
         val fw = o.optString("fw"); val hw = o.optString("hw")
         if (fw.isNotEmpty() || hw.isNotEmpty()) audit += "📋 الراوتر: $hw | فيرموير: $fw"
@@ -1125,361 +1641,302 @@ class MainActivity : Activity() {
         if (up.isNotEmpty()) {
             audit += "⏱ مدة التشغيل: $up"
             val d = Regex("(\\d+)\\s*day", RegexOption.IGNORE_CASE).find(up)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-            if (d >= 14) { oldUptime = true; audit += "⚠ الراوتر يعمل منذ $d يوماً بلا إعادة تشغيل، وهذا يبطّئه (سأعيد تشغيله)" }
+            if (d >= 14) { oldUptime = true; audit += "⚠ الراوتر يعمل منذ $d يوماً بلا إعادة تشغيل، وهذا يبطّئه" }
         }
         val dns = o.optString("dns")
-        if (dns.isNotEmpty()) audit += "🌐 DNS الحالي في الراوتر: $dns"
+        if (dns.isNotEmpty()) audit += "🌐 DNS الحالي في صفحة الحالة: $dns"
     }
 
-    private fun step() {
-        ticks++
-        if (ticks > 260) { finish("⚠ انتهت المهلة قبل إكمال كل الخطوات"); return }
-        web.evaluateJavascript(js(phase)) { raw ->
-            val r = try { JSONObject(raw ?: "") } catch (e: Exception) { null }
-            var wait = 2500L
-            var stop = false
-            if (r != null && r.optBoolean("pw")) {
-                loginTries++
-                log(if (passEt.text.isNotEmpty() && loginTries <= 2) "🔐 أسجّل الدخول تلقائياً..." else "✍ بانتظار تسجيل دخولك في صفحة الراوتر...")
-            } else if (r != null) {
-                pt++
-                val found = r.optBoolean("found")
-                val sp = getSharedPreferences("nf", 0)
-                when (phase) {
-                    "status" -> {
-                        if (found) { log("✅ قرأت صفحة حالة الراوتر"); parseStatus(r.optString("info")); nextPhase() }
-                        else if (pt > 12) { audit += "📋 تعذّر قراءة صفحة الحالة"; log("⏭ تخطّي صفحة الحالة"); nextPhase() }
-                        else log("🔎 أفتح صفحة حالة الراوتر...")
-                    }
-                    "dns" -> {
-                        if (found) {
-                            dnsDone = true
-                            if (r.optBoolean("changed")) {
-                                changed = true; wait = 5000
-                                if (!restoring) sp.edit().putString("bk_dns1", r.optString("info")).putString("bk_dns2", r.optString("info2")).apply()
-                                val m = "🧭 DNS: كان ${r.optString("info")} ← أصبح $bestDns" + (if (bestDns2.isNotEmpty()) " (ثانوي $bestDns2)" else "")
-                                report += m; log(m)
-                            } else { audit += "🧭 DNS ${r.optString("info")} مناسب (بدون تغيير)"; log("🧭 DNS الحالي مناسب، لا تغيير") }
-                            nextPhase()
-                        } else if (pt > 30) { audit += "🧭 لم أجد إعدادات DNS (تخطّيت)"; log("⏭ لم أجد إعدادات DNS"); nextPhase() }
-                        else log("🔎 أبحث عن إعدادات DNS...")
-                    }
-                    "clients" -> {
-                        if (found) {
-                            devices = r.optString("info").toIntOrNull() ?: -1
-                            audit += if (devices > 8) "👥 الأجهزة المتصلة: $devices ⚠ عدد كبير قد يبطّئ الشبكة" else "👥 الأجهزة المتصلة: $devices"
-                            log("👥 الأجهزة المتصلة: $devices")
-                            nextPhase()
-                        } else if (pt > 12) { audit += "👥 تعذّر قراءة الأجهزة المتصلة"; nextPhase() }
-                        else log("🔎 أقرأ الأجهزة المتصلة...")
-                    }
-                    "chan" -> {
-                        if (found) {
-                            chanDone = true
-                            val cur = r.optString("info"); val md = r.optString("md"); val wd = r.optString("wd")
-                            val cn = r.optInt("cn", -1)
-                            audit += "📡 القناة الحالية: $cur | العرض: ${if (wd.isEmpty()) "—" else wd} | النمط: ${if (md.isEmpty()) "—" else md}"
-                            if (r.optBoolean("changed")) {
-                                changed = true; wait = 5000
-                                if (!restoring) sp.edit().putInt("bk_ch", cn.coerceAtLeast(0)).putString("bk_wd", wd).apply()
-                                if (cn != bestCh) {
-                                    val m = "📡 القناة: كانت ${if (cn <= 0) "تلقائي" else cn.toString()} ← أصبحت ${if (bestCh == 0) "تلقائي" else bestCh.toString()}"
-                                    report += m; log(m)
-                                }
-                                if (r.optBoolean("w")) { val m = "📶 عرض القناة ← ${if (restoring) restoreWid else "20MHz (أقل تداخلاً)"}"; report += m; log(m) }
-                            } else { audit += "📡 القناة والعرض مناسبان (بدون تغيير)"; log("📡 القناة والعرض مناسبان") }
-                            nextPhase()
-                        } else if (pt > 30) { audit += "📡 لم أجد إعدادات القناة (تخطّيت)"; log("⏭ لم أجد إعدادات القناة"); nextPhase() }
-                        else log("🔎 أبحث عن إعدادات القناة...")
-                    }
-                    "reboot" -> {
-                        if (r.optBoolean("clicked")) {
-                            stop = true
-                            val m = if (changed) "🔄 إعادة تشغيل الراوتر لتطبيق التغييرات"
-                                else if (oldUptime) "🔄 إعادة تشغيل الراوتر (يعمل منذ مدة طويلة)"
-                                else "🔄 إعادة تشغيل الراوتر لأن السرعة منخفضة (تنظيف الاتصال)"
-                            if (!report.contains(m)) report += m
-                            rebooting(false)
-                        } else if (pt > 30) {
-                            stop = true
-                            rebooting(true)
-                        } else {
-                            if (pt == 12) log("🧩 العناصر الظاهرة: ${r.optString("dbg").take(350)}")
-                            log("🔁 أبحث عن زر إعادة التشغيل...")
-                        }
-                    }
-                }
-                if (phase == "done") { stop = true; finish("✅ إعدادات السرعة سليمة، لا حاجة لإعادة التشغيل") }
-            }
-            if (!stop) ui.postDelayed({ step() }, wait)
+    private fun readRouterState() {
+        log("🔎 أقرأ إعدادات DNS الحالية (قراءة فقط)...")
+        val d = navRead("dns", 30)
+        if (d != null) { rDnsOk = true; rDns1 = d.optString("info"); rDns2 = d.optString("info2"); audit += "🧭 DNS في الراوتر: $rDns1 ${if (rDns2.isNotEmpty()) "/ $rDns2" else ""}" }
+        else audit += "🧭 لم أجد حقول DNS قابلة للتعديل"
+        val c = navRead("clients", 12)
+        if (c != null) {
+            devices = c.optString("info").toIntOrNull() ?: -1
+            audit += if (devices > 8) "👥 الأجهزة المتصلة: $devices ⚠ عدد كبير قد يبطّئ الشبكة" else "👥 الأجهزة المتصلة: $devices"
         }
+        log("🔎 أقرأ إعدادات القناة والقنوات المدعومة (قراءة فقط)...")
+        val ch = navRead("chan", 30)
+        if (ch != null) {
+            rChOk = true
+            rCh = ch.optInt("cn", -1); rWd = ch.optString("wd"); rMd = ch.optString("md")
+            rChOpts = try { val a = JSONArray(ch.optString("opts", "[]")); (0 until a.length()).map { a.getInt(it) } } catch (e: Exception) { emptyList() }
+            rWopts = try { jsonList(JSONArray(ch.optString("wopts", "[]"))) } catch (e: Exception) { emptyList() }
+            audit += "📡 القناة الحالية: ${ch.optString("info")} | العرض: ${if (rWd.isEmpty()) "—" else rWd} | النمط: ${if (rMd.isEmpty()) "—" else rMd} | القنوات المدعومة: ${rChOpts.size}"
+        } else audit += "📡 لم أجد إعدادات القناة"
     }
 
-    // ================= الواي فاي بعد الريبوت (سبب التوقف السابق) =================
-    // بعد الريبوت قد يختار أندرويد بيانات الهاتف كشبكة افتراضية فتفشل كل الاتصالات المحلية؛ لذلك نربط التطبيق بالواي فاي
-    private fun bindToWifi(): Boolean = try {
-        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val n = cm.allNetworks.firstOrNull { cm.getNetworkCapabilities(it)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true }
-        if (n != null) { cm.bindProcessToNetwork(n); true } else false
-    } catch (e: Exception) { false }
+    private fun mainFlow() {
+        // ----- الدخول وتحديد الراوتر وواجهته قبل أي تعديل -----
+        setStep(3, 1); setChip("● جارٍ الدخول", cAmber)
+        captureIdentity()
+        log("🔌 أفتح صفحة الراوتر $gwIp وأسجّل الدخول...")
+        openRouter()
+        val st = navRead("status", ROUTER_TICKS)
+        if (st == null) {
+            if (loginStuck) { loginFailed("تعذّر تسجيل الدخول. تأكد من اسم المستخدم وكلمة المرور."); return }
+            unknownUi = true
+            audit += "📋 لم أتعرّف على واجهة الراوتر (صفحة الحالة غير مقروءة). سأقرأ فقط ولن أعدّل إلا بعد موافقتك وتحقق صارم."
+            setStep(3, 3)
+        } else { parseStatus(st.optString("info")); setStep(3, 2) }
+        readRouterState()
 
-    private fun routerUp(gw: String): Boolean = listOf(80, 443, 8080).any { tcp(gw, it) >= 0 }
+        // ----- قياسات الهاتف -----
+        diagnose()
+        chk()
 
-    private fun nudgeWifi() {
+        // ----- الخطة والموافقة -----
+        val plan = buildPlan()
+        var anyPlanned = plan.dns || plan.chan
+        if (anyPlanned) {
+            val lines = mutableListOf<String>()
+            if (plan.dns) lines += "• DNS: ${rDns1.ifEmpty { "—" }} ← ${plan.d1}" + (if (plan.d2.isNotEmpty()) " (ثانوي ${plan.d2})" else "")
+            if (plan.chan) lines += "• القناة: ${if (rCh > 0) rCh.toString() else "تلقائي"} ← ${plan.ch}" + (if (plan.wid.isNotEmpty()) " + عرض ${plan.wid}MHz" else "")
+            val warn = "\n\nسأحفظ نسخة من الإعدادات الأصلية أولاً، ولا أعتبر أي تغيير ناجحاً إلا بعد إعادة قراءته من الراوتر." +
+                (if (plan.chan) "\n⚠ تغيير القناة قد يقطع الواي فاي لثوانٍ." else "") +
+                (if (unknownUi) "\n⚠ واجهة الراوتر غير معروفة لي؛ قد لا تنجح الأتمتة." else "")
+            if (!askUser("تأكيد التعديلات", lines.joinToString("\n") + warn)) {
+                skipList += "جميع التعديلات: لم يوافق المستخدم"
+                plan.dns = false; plan.chan = false; anyPlanned = false
+            }
+        }
+
+        if (anyPlanned) {
+            approved.set(true)
+            setStep(5, 0)
+            if (!saveBackup()) {
+                failList += "تعذّر حفظ نسخة احتياطية صالحة، لذلك لم أعدّل أي إعداد"
+                plan.dns = false; plan.chan = false
+                setStep(4, 4); setStep(5, 4)
+            } else {
+                log("🗄 تم حفظ نسخة احتياطية صالحة للإعدادات الأصلية")
+                audit += "🗄 نسخة احتياطية: DNS $rDns1 / القناة ${if (rCh > 0) rCh else "تلقائي"}"
+            }
+        }
+
+        // ----- تطبيق DNS -----
+        if (plan.dns) {
+            setStep(4, 1); plannedCount++
+            val ok = applyDnsValue(plan.d1, plan.d2, "تغيير")
+            if (ok) {
+                verifiedCount++; changedAny = true; markApplied(plan.d1, null)
+                okList += "DNS: كان $rDns1 ← أصبح ${plan.d1}" + (if (plan.d2.isNotEmpty()) " (ثانوي ${plan.d2})" else "") + " — تم التحقق بإعادة القراءة"
+                setStep(4, 2)
+            } else {
+                if (failList.none { it.startsWith("DNS") }) failList += "DNS: لم تتطابق القيمة بعد الحفظ، لذلك تراجعتُ"
+                log("↩ أحاول إرجاع DNS لقيمته الأصلية...")
+                val back = applyDnsValue(rDns1, rDns2, "تراجع")
+                failList += if (back) "DNS: تم التراجع للقيمة الأصلية والتحقق منها" else "DNS: تعذّر التحقق من التراجع، راجع الراوتر يدوياً (الأصل $rDns1)"
+                setStep(4, 4)
+            }
+        } else setStep(4, 3)
+
+        // ----- تطبيق القناة والعرض -----
+        if (plan.chan) {
+            setStep(5, 1); plannedCount++
+            val ok = applyChanValue(plan.ch, plan.wid, "تغيير")
+            if (ok) {
+                verifiedCount++; changedAny = true; markApplied(null, plan.ch)
+                okList += "القناة: كانت ${if (rCh > 0) rCh else "تلقائي"} ← أصبحت ${plan.ch}" + (if (plan.wid.isNotEmpty()) " + عرض 20MHz" else "") + " — تم التحقق بإعادة القراءة"
+                setStep(5, 2)
+            } else {
+                if (failList.none { it.startsWith("القناة") }) failList += "القناة: لم تتطابق القيمة بعد الحفظ، لذلك تراجعتُ"
+                log("↩ أحاول إرجاع القناة لقيمتها الأصلية...")
+                val back = applyChanValue(if (rCh > 0) rCh else 0, rWd, "تراجع")
+                failList += if (back) "القناة: تم التراجع للقيمة الأصلية والتحقق منها" else "القناة: تعذّر التحقق من التراجع، راجع الراوتر يدوياً"
+                setStep(5, 4)
+            }
+        } else setStep(5, 3)
+        if (!(plan.dns) || !(plan.chan)) manualSteps(plan)
+
+        // ----- إعادة التشغيل (بعد موافقة صريحة) -----
+        val needReboot = changedAny || oldUptime || (lowSpeed && !lineProblem)
+        if (needReboot) {
+            val why = if (changedAny) "لتطبيق التغييرات" else if (oldUptime) "لأنه يعمل منذ مدة طويلة" else "لتنظيف الاتصال لأن السرعة منخفضة"
+            approved.set(true)
+            val yes = askUser("إعادة تشغيل الراوتر؟",
+                "أقترح إعادة تشغيل الراوتر $why.\n\n⚠ سينقطع الإنترنت والواي فاي عن كل الأجهزة نحو 2–4 دقائق، وسأنتظر عودة نفس الراوتر والإنترنت قبل أي قياس.",
+                "نعم، أعد التشغيل", "لا")
+            if (yes) {
+                rebootPlanned = true; plannedCount++
+                val done = rebootStage()
+                if (done) verifiedCount++
+                if (done && changedAny) postRebootVerify(plan)
+            } else { skipList += "إعادة التشغيل: رفضها المستخدم"; setStep(6, 3) }
+        } else { skipList += "إعادة التشغيل: غير مطلوبة"; setStep(6, 3) }
+
+        finalizeRun()
+    }
+
+    private fun manualSteps(plan: Plan) {
+        if (restoring) return
+        if (dnsWorth && !plan.dns && !rDnsOk && bestDns.isNotEmpty())
+            skipList += "DNS: تعذّرت الأتمتة على هذا الراوتر. يدوياً: من إعدادات الراوتر (DHCP/LAN/WAN) اجعل الأساسي $bestDns" + (if (bestDns2.isNotEmpty()) " والثانوي $bestDns2" else "")
+        if (!rChOk && scan.ok)
+            skipList += "القناة: لم أجد قائمة القنوات في الراوتر. يدوياً: Wireless ← 2.4GHz ← Channel، والأقل ازدحاماً حسب مسحي موضّحة في التقرير"
+    }
+
+    // ================= قياسات الهاتف =================
+    private fun diagnose() {
+        val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        val info = wm.connectionInfo
+        val is24 = info.frequency in 2400..2500
+        phoneCh = if (is24) (if (info.frequency == 2484) 14 else (info.frequency - 2407) / 5) else 0
+
+        setStep(0, 1)
+        val s = gwAndNet("قبل")
+        bDown = s.sp.down; bUp = s.sp.up; bLoaded = s.sp.loaded; gwBefore = s.gwMs; pingB = s.ping
+        runOnUiThread { if (!destroyed) beforeTv.text = mb(bDown) }
+        scoreB = health(pingB, bDown)
+        updatePingCard()
+        setStep(0, 2)
+        lowSpeed = bDown in 0.0..5.0
+        lineProblem = s.reach.gw && !s.reach.internet || (pingB.avg >= 0 && (pingB.loss > 5 || pingB.avg > 120))
+        val bloat = bLoaded > 0 && pingB.avg > 0 && bLoaded - pingB.avg > 150
+
+        setStep(1, 1)
+        say("⏳ قياس DNS (11 خادماً × 24 استعلاماً، مهلة إجمالية 25 ثانية)...")
+        curDnsAtStart = if (rDns1.isNotEmpty() && isIp(rDns1)) rDns1 else (ispDns().firstOrNull() ?: "")
+        val ranked = benchmarkDns(listOf(rDns1, rDns2))
+        dnsRank = ranked
+        chooseDns(ranked, curDnsAtStart)
+        renderDns(); say(dnsReport)
+        setStep(1, 2)
+
+        setStep(2, 1)
+        say("⏳ مسح القنوات (3 مرات)...")
+        scan = scanChannels()
+        if (scan.ok) say("📡 تم مسح ${scan.count} شبكة مجاورة على 2.4GHz") else say("⚠ مسح القنوات غير متاح: ${scan.note}")
+        setStep(2, if (scan.ok) 2 else 3)
+
+        val causes = mutableListOf<String>()
+        if (info.rssi < -75) causes += "📶 إشارة الواي فاي ضعيفة (${info.rssi}dBm): اقترب من الراوتر أو أزل العوائق."
+        if (info.linkSpeed in 1..20) causes += "🐌 سرعة وصلة الواي فاي بين هاتفك والراوتر منخفضة (${info.linkSpeed}Mbps)."
+        if (!s.reach.gw) causes += "🔌 تعذّر الوصول إلى الراوتر نفسه ($gwIp): مشكلة واي فاي أو عنوان خاطئ."
+        else if (!s.reach.internet) causes += "🌐 الراوتر يعمل لكن الإنترنت غير متاح عبر أي وسيلة (TCP/UDP/HTTP): غالباً الخط أو المزوّد."
+        if (s.reach.tcp && !s.reach.udp) causes += "ℹ UDP/53 محجوب على هذه الشبكة لكن الإنترنت يعمل عبر TCP؛ لذلك قياس DNS قد يكون محدوداً."
+        if (s.gwLoss > 5 || s.gwMs > 40) causes += "🔌 اتصالك بالراوتر غير مستقر (فقد ${s.gwLoss}%، ${ms(s.gwMs)})."
+        if (lineProblem && s.reach.internet) causes += "🌐 الإنترنت غير مستقر (${ms(pingB.avg)}، فقد ${pingB.loss}%، تذبذب ${pingB.jitter.toInt()}ms): غالباً الخط أو المزوّد."
+        if (bloat) causes += "📉 عند التحميل يرتفع زمن الاستجابة من ${pingB.avg.toInt()} إلى ${bLoaded.toInt()}ms."
+        if (dnsWorth) causes += "🧭 يوجد DNS أسرع بشكل واضح من الحالي ← المرشّح: $bestDns."
+        if (scan.ok && is24) causes += "📡 ${scan.count} شبكة مجاورة على 2.4GHz."
+        if (is24 && info.rssi > -65 && wm.is5GHzBandSupported) causes += "⚡ هاتفك يدعم 5GHz وإشارتك جيدة: اتصل بشبكة 5GHz (إن وُجدت)."
+        if (lowSpeed) causes += "🐢 سرعة التنزيل منخفضة جداً (${fmt(bDown)})."
+        if (causes.isEmpty()) causes += "✅ لم أجد مشكلة واضحة."
+
+        primary = when {
+            !s.reach.gw -> "تعذّر الوصول إلى الراوتر: تحقق من الاتصال بالواي فاي وعنوان الراوتر."
+            !s.reach.internet -> "الراوتر سليم لكن الإنترنت غير متاح: الخط أو شركة الإنترنت."
+            info.rssi < -75 || s.gwLoss > 5 || s.gwMs > 40 -> "المشكلة عندك محلياً: ضعف الواي فاي أو بعدك عن الراوتر أو ازدحام القنوات."
+            lineProblem -> "المشكلة في الخط أو شركة الإنترنت (الراوتر سليم)."
+            bDown in 0.0..10.0 -> "الواي فاي والراوتر سليمان، والسرعة منخفضة: سرعة الباقة أو الخط أو ازدحام الأجهزة."
+            bloat -> "الخط يزدحم عند التحميل: قلّل الأجهزة أو فعّل QoS في الراوتر."
+            else -> "لا توجد مشكلة واضحة."
+        }
+        diagText = "📊 نتائج فحص الهاتف\n" +
+            "إشارة: ${info.rssi}dBm | ${if (is24) "2.4" else "5"}GHz قناة ${if (phoneCh > 0) phoneCh else "—"} | وصلة ${info.linkSpeed}Mbps\n" +
+            "الراوتر: ${ms(s.gwMs)} فقد ${s.gwLoss}%\n" +
+            "الإنترنت: ${pingLine(pingB)}\n" +
+            "السرعة: تنزيل ${fmt(bDown)} | رفع ${fmt(bUp)} | زمن أثناء التحميل: ${if (bLoaded > 0) "${bLoaded.toInt()}ms" else "—"}\n" +
+            dnsReport + "\n\n🔎 الأسباب:\n" + causes.joinToString("\n")
+        setReport(diagText)
+    }
+
+    private fun buildPlan(): Plan {
+        val p = Plan()
+        // DNS
+        if (!rDnsOk) skipList += "DNS: لم أجد حقل DNS قابلاً للتعديل في الراوتر"
+        else if (!dnsWorth) skipList += "DNS: الحالي مناسب أو لم أستطع قياس بديل أفضل بثقة"
+        else if (!isIp(bestDns)) skipList += "DNS: لم أجد بديلاً صالحاً"
+        else { p.dns = true; p.d1 = bestDns; p.d2 = if (bestDns2.isNotEmpty() && isIp(bestDns2)) bestDns2 else "" }
+        // القناة
+        val target = chooseChannel()
+        if (!rChOk) skipList += "القناة: لم أجد إعدادات القناة في الراوتر"
+        else if (!scan.ok) skipList += "القناة: مسح القنوات غير متاح (${scan.note}) فلن أغيّر شيئاً بلا قياس"
+        else if (target == null) skipList += "القناة: لا توجد قنوات مدعومة قابلة للمقارنة"
+        else {
+            val cur = if (rCh > 0) rCh else if (phoneCh in 1..14) phoneCh else 0
+            val lc = scan.loads[cur] ?: 0.0; val lb = scan.loads[target] ?: 0.0
+            val curBad = cur > 0 && target != cur && scan.count > 0 && lc > lb * 2
+            val crowded = scan.count > 5 || curBad
+            val wdNow = normW(rWd)
+            val canNarrow = rWopts.any { normW(it).let { t -> t == "20" || t == "20mhz" } }
+            val widthChange = crowded && canNarrow && rWd.isNotEmpty() && wdNow != "20" && wdNow != "20mhz"
+            if (curBad) { p.chan = true; p.ch = target }
+            else if (rCh <= 0 && scan.count > 8 && phoneCh > 0 && (scan.loads[phoneCh] ?: 0.0) > lb * 2) { p.chan = true; p.ch = target }
+            else skipList += "القناة: الحالية (${if (rCh > 0) rCh else "تلقائي"}) مناسبة، لا داعي للتغيير"
+            if (widthChange) { p.wid = "20"; if (!p.chan) { p.chan = true; p.ch = if (rCh > 0) rCh else 0 } }
+            else if (crowded) skipList += "عرض القناة: لا خيار 20MHz صريح أو العرض الحالي مناسب"
+        }
+        return p
+    }
+
+    // ================= إعادة التشغيل (مرحلة انتظار مستقلة ومحفوظة) =================
+    private fun rebootStage(): Boolean {
+        setStep(6, 1)
+        saveStage("rebooting")
+        log("🔄 أبحث عن زر إعادة التشغيل...")
+        openRouter()
+        val r = navRead("reboot", 30, until = { it.optBoolean("clicked") })
+        var manual = false
+        if (r == null) {
+            failList += "إعادة التشغيل: لم أجد زر Reboot في واجهة الراوتر"
+            log("🖐 اضغط Reboot بنفسك في صفحة الراوتر (كبّرها بإصبعين)، وأنا أراقب")
+            manual = true
+        } else {
+            log("🔄 تم الضغط على Reboot، أنتظر انقطاع الراوتر...")
+            for (i in 1..3) { sleepC(2000); if (tcpAny(gwIp) >= 0) runOnUiThread { if (!destroyed) web.evaluateJavascript(confirmJs, null) } }
+        }
+        // انتظار الانقطاع (قراءتان متتاليتان فاشلتان)
+        var down = false
+        var fails = 0
+        val limit = if (manual) 40 else 20
+        var i = 0
+        while (!down && i < limit) {
+            sleepC(3000); bindToWifi()
+            if (tcpAny(gwIp) < 0) fails++ else fails = 0
+            if (fails >= 2) down = true
+            i++
+        }
+        if (!down) {
+            failList += "إعادة التشغيل: لم يُرصد انقطاع للراوتر، لا أستطيع تأكيد حدوثها (أعد تشغيله يدوياً إن لزم)"
+            setStep(6, 4); rebootOk = false
+            clearStage()
+            return false
+        }
+        rebootOk = true
+        log("📴 الراوتر انقطع، أنتظر رجوعه...")
+        saveStage("waiting_router")
+        val up = waitRouterBack(240_000)
+        if (!up) {
+            failList += "إعادة التشغيل: انقطع الراوتر لكن لم أصل لنفس الراوتر بعد 4 دقائق"
+            setStep(6, 4); rebootOk = false
+            return false
+        }
+        log("✅ الراوتر رجع")
+        saveStage("waiting_internet")
+        okList += "إعادة تشغيل الراوتر: انقطع ثم رجع نفس الراوتر (تحقق فعلي)"
+        setStep(6, 2)
+        return true
+    }
+
+    /** بعد الريبوت: هل بقيت القيم المحفوظة فعلاً؟ (يتطلب تسجيل دخول جديد). */
+    private fun postRebootVerify(plan: Plan) {
+        approved.set(true)
+        log("🔍 أتحقق أن الإعدادات بقيت بعد إعادة التشغيل...")
+        loginTries = 0
         try {
-            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            if (!wm.isWifiEnabled) wm.isWifiEnabled = true
-            wm.reconnect()
-        } catch (e: Exception) {}
-    }
-
-    private fun awaitInternet() {
-        val t0 = System.currentTimeMillis()
-        var n = 0
-        while (System.currentTimeMillis() - t0 < 90_000L) {
-            bindToWifi()
-            if (dnsUdp("1.1.1.1") >= 0 || dnsUdp("8.8.8.8") >= 0) { log("🌐 الإنترنت رجع"); break }
-            if (n % 4 == 0) log("⏳ أنتظر عودة الإنترنت بعد إعادة التشغيل...")
-            n++
-            Thread.sleep(3000)
-        }
-        Thread.sleep(4000)
-    }
-
-    // ================= مراقبة إعادة التشغيل (لا تتوقف أبداً: تكمل للفحص والنتيجة دائماً) =================
-    private fun rebooting(manualMode: Boolean) {
-        val gw = gwIp
-        log(if (manualMode) "🖐 اضغط Reboot بنفسك في صفحة الراوتر (كبّرها بإصبعين)، وأنا أراقب وأكمل تلقائياً" else "🔄 تم الضغط على Reboot، أنتظر انقطاع الراوتر...")
-        thread {
-            try {
-                var down = false
-                var i = 0
-                val limit = if (manualMode) 40 else 12
-                while (!down && i < limit) {
-                    Thread.sleep(3000)
-                    bindToWifi()
-                    if (!manualMode && i < 4) runOnUiThread { web.evaluateJavascript(confirmJs, null) }
-                    if (!routerUp(gw)) down = true
-                    i++
-                }
-                if (!down) {
-                    if (!manualMode && rebootTry < 2) {
-                        rebootTry++
-                        log("⚠ الراوتر لم ينقطع، أعيد المحاولة ($rebootTry/2)")
-                        runOnUiThread { moveTo("reboot"); ui.postDelayed({ step() }, 800) }
-                        return@thread
-                    }
-                    if (!manualMode) { runOnUiThread { rebooting(true) }; return@thread }
-                    setStep(6, 3)
-                    rebootOk = false
-                    finalizeRun("⚠ لم أتأكد من إعادة تشغيل الراوتر (أعد تشغيله يدوياً)")
-                    return@thread
-                }
-                rebootOk = true
-                log("📴 الراوتر انقطع، أنتظر رجوعه...")
-                val t0 = System.currentTimeMillis()
-                var up = false
-                var lastNote = 0L
-                while (!up && System.currentTimeMillis() - t0 < 240_000L) {
-                    bindToWifi()
-                    if (routerUp(gw)) {
-                        up = true
-                    } else {
-                        val el = (System.currentTimeMillis() - t0) / 1000
-                        if (el - lastNote >= 15) {
-                            lastNote = el
-                            log("⏳ أنتظر رجوع الراوتر والواي فاي... (${el}ث)")
-                            nudgeWifi()
-                        }
-                        if (el in 100L..110L) log("📶 لو الواي فاي لم يتصل تلقائياً، اتصل بشبكتك يدوياً وسأكمل")
-                        Thread.sleep(3000)
-                    }
-                }
-                setStep(6, if (up) 2 else 3)
-                if (up) log("✅ الراوتر رجع") else log("⚠ لم أصل لصفحة الراوتر، سأكمل قياس الجودة على أي حال")
-                finalizeRun(if (up) "✅ تمت إعادة تشغيل الراوتر فعلياً (انقطع ثم رجع)" else "⚠ الراوتر أعاد التشغيل لكن لم أستطع الوصول لصفحته بعد رجوعه")
-            } catch (e: Exception) {
-                log("❌ خطأ أثناء المراقبة: ${e.message}")
-                finalizeRun("⚠ حدث خطأ أثناء مراقبة إعادة التشغيل")
+            if (plan.dns && okList.any { it.startsWith("DNS: كان") }) {
+                if (verifyDns(plan.d1, plan.d2)) okList += "DNS: بقي ${plan.d1} بعد إعادة التشغيل"
+                else failList += "DNS: لم تثبت القيمة بعد إعادة التشغيل (قد يكون الراوتر تجاهلها)"
             }
-        }
-    }
-
-    // ================= الفحص بعد الإصلاح ← المقارنة ← تسجيل الخروج ← النتيجة =================
-    private fun finalizeRun(msg: String) {
-        try {
-            bindToWifi()
-            setStep(7, 1)
-            if (rebootOk) awaitInternet()
-            log("⏱ أقيس السرعة بعد الإصلاح...")
-            val (after, _) = speedRetry()
-            log("⏱ أقيس استقرار الـ Ping بعد الإصلاح...")
-            val pa = pingStats(20)
-            gwAfter = stats({ tcp(gwIp, 80) }).first
-            pingA = pa
-            scoreA = health(pa.first, pa.second, pa.third, after)
-            updatePingCard()
-            runOnUiThread {
-                afterTv.text = mb(after)
-                if (beforeSpeed > 0 && after > 0) {
-                    val pct = (after - beforeSpeed) / beforeSpeed * 100
-                    gainTv.text = (if (pct >= 0) "+" else "") + "%.0f%%".format(pct)
-                    gainTv.setTextColor(if (pct >= 0) cGreen else cRed)
-                }
-            }
-            setStep(7, 2)
-            setStep(8, 1)
-            log("🚪 أسجّل الخروج من صفحة الراوتر...")
-            doLogout()
-            setStep(8, 2)
-            showFinal(msg, after, pa)
-        } catch (e: Exception) {
-            log("❌ خطأ أثناء الفحص النهائي: ${e.message}")
-            setChip("● خطأ", cRed)
-            endRun()
-        }
-    }
-
-    private fun doLogout() {
-        val latch = java.util.concurrent.CountDownLatch(1)
-        runOnUiThread {
-            web.evaluateJavascript(logoutJs, null)
-            ui.postDelayed({
-                CookieManager.getInstance().removeAllCookies(null)
-                web.clearCache(true); web.loadUrl("about:blank")
-                latch.countDown()
-            }, 2000)
-        }
-        latch.await(6, java.util.concurrent.TimeUnit.SECONDS)
-        loggedOut = true
-    }
-
-    private fun endRun() {
-        running = false; restoring = false
-        runOnUiThread { restoreBtn.isEnabled = hasBackup(); startBtn.isEnabled = true }
-    }
-
-    private fun finish(msg: String) {
-        log(msg)
-        if (stepState[6] == 0 || stepState[6] == 1) setStep(6, 3)
-        thread { finalizeRun(msg) }
-    }
-
-    private fun manual(): String {
-        if (restoring) return ""
-        val s = mutableListOf<String>()
-        if (dnsWorth && !dnsDone) s += "• DNS: من إعدادات الراوتر (DHCP أو LAN أو WAN) اجعل الأساسي $bestDns والثانوي $bestDns2"
-        if (!chanDone) s += "• القناة: من Wireless ← 2.4GHz اجعل Channel = $bestCh" + (if (crowded) " وعرض القناة 20MHz" else "")
-        return if (s.isEmpty()) "" else "\n\n🖐 خطوات يدوية (واجهة راوترك مختلفة عن المتوقع):\n" + s.joinToString("\n")
-    }
-
-    // ================= ترتيب الـ DNS ونسبة النجاح =================
-    private fun dnsRankText(): String {
-        if (dnsRank.isEmpty()) return "لم يتم القياس"
-        return dnsRank.take(11).mapIndexed { i, p ->
-            val name = (dnsNames[p.first] ?: "DNS المزوّد") + (if (p.first == curDnsAtStart) " (الحالي)" else "")
-            val mark = if (p.first == bestDns) " ⭐" else if (p.first == bestDns2) " ✔" else ""
-            "${i + 1}. $name ${p.first} — ${p.second.toInt()}ms$mark"
-        }.joinToString("\n")
-    }
-
-    private fun renderDns() { val t = dnsRankText(); runOnUiThread { dnsTv.text = t } }
-
-    // نسبة النجاح = 40% اكتمال المهام + 40% صحة الشبكة بعد الإصلاح + 20% مقدار التحسّن
-    private fun successScore(after: Double): Int {
-        var tasks = 0
-        if (dnsRank.isNotEmpty()) tasks += 10
-        if (dnsDone) tasks += 20
-        if (chanDone) tasks += 20
-        if (!rebootPlanned || rebootOk) tasks += 25
-        if (after > 0) tasks += 15
-        if (loggedOut) tasks += 10
-        scTasks = tasks
-        scImpr = (50 + (scoreA - scoreB) * 2.5).coerceIn(0.0, 100.0).toInt()
-        return (tasks * 0.4 + scoreA * 0.4 + scImpr * 0.2).toInt().coerceIn(0, 100)
-    }
-
-    private fun ms(x: Double) = if (x < 0) "—" else "${x.toInt()}ms"
-
-    // عنوان النتيجة + تفاصيل المقارنة + لون
-    private fun improvementSummary(after: Double, pa: Triple<Double, Double, Int>): Triple<String, String, Int> {
-        val lines = mutableListOf<String>()
-        var head = "⚠ تعذّر مقارنة السرعة"
-        var col = cMuted
-        if (beforeSpeed > 0 && after > 0) {
-            val g = (after - beforeSpeed) / beforeSpeed * 100
-            val gi = Math.abs(g).toInt()
-            if (g >= 10) { head = "🎉 تحسّنت السرعة بنسبة +$gi%"; col = cGreen; lines += "✅ السرعة: ${fmt(beforeSpeed)} ← ${fmt(after)} (+$gi%)" }
-            else if (g <= -10) { head = "⚠ السرعة انخفضت $gi%"; col = cRed; lines += "⚠ السرعة: ${fmt(beforeSpeed)} ← ${fmt(after)} (-$gi%) — قد يكون تقلّباً مؤقتاً أو الخط نفسه" }
-            else { head = "➖ السرعة شبه ثابتة"; col = cAmber; lines += "➖ السرعة: ${fmt(beforeSpeed)} ← ${fmt(after)} (${if (g >= 0) "+" else "-"}$gi%)" }
-        } else lines += "⚠ تعذّر قياس السرعة في أحد الاختبارين"
-        if (pingB.first > 0 && pa.first > 0) {
-            val pg = (pingB.first - pa.first) / pingB.first * 100
-            val pi = Math.abs(pg).toInt()
-            lines += if (pg >= 10) "✅ زمن الاستجابة (Ping) تحسّن $pi%" else if (pg <= -10) "⚠ زمن الاستجابة ارتفع $pi%" else "➖ الـ Ping شبه ثابت (${pa.first.toInt()}ms)"
-        }
-        val jb = pingB.second; val ja = pa.second
-        lines += if (ja < jb - 1) "✅ استقرار الاتصال تحسّن (تذبذب ${jb.toInt()}ms ← ${ja.toInt()}ms)"
-            else if (ja > jb + 1) "⚠ التذبذب زاد (${jb.toInt()}ms ← ${ja.toInt()}ms)"
-            else "➖ التذبذب ثابت (${ja.toInt()}ms)"
-        lines += "📈 كفاءة الشبكة: $scoreB% ← $scoreA%"
-        return Triple(head, lines.joinToString("\n"), col)
-    }
-
-    private fun advice(after: Double, pa: Triple<Double, Double, Int>): String {
-        val tips = mutableListOf<String>()
-        if (after in 0.0..5.0) tips += "⚠ السرعة ما زالت منخفضة بعد الضبط: السبب خارج الراوتر (خط الشركة أو الباقة). انسخ التقرير وأرسله للشركة."
-        else if (beforeSpeed > 0 && after > beforeSpeed * 1.3) tips += "✅ تحسّنت السرعة بشكل واضح."
-        if (pa.second > 15 || pa.third > 2) tips += "📉 الـ Ping لسه غير مستقر (تذبذب ${pa.second.toInt()}ms، فقد ${pa.third}%): جرّب 5GHz أو كابل وقلّل الأجهزة المتصلة."
-        else if (pa.first in 0.0..60.0) tips += "✅ الـ Ping مستقر."
-        if (devices > 8) tips += "💡 عدد الأجهزة المتصلة كبير ($devices). افصل غير المستخدم."
-        if (tips.isEmpty()) tips += "💡 الشبكة مستقرة."
-        return tips.joinToString("\n")
-    }
-
-    private fun showFinal(msg: String, after: Double, pa: Triple<Double, Double, Int>) {
-        val sp = getSharedPreferences("nf", 0)
-        val prev = sp.getFloat("last", -1f)
-        val pct = if (restoring) -1 else successScore(after)
-        val imp = improvementSummary(after, pa)
-        val sb = StringBuilder()
-        sb.append(msg).append("\n\n")
-        if (pct >= 0) sb.append("🏆 نسبة نجاح الاختبار: $pct/100\n${imp.first}\n${imp.second}\n(اكتمال المهام $scTasks/100 • صحة الشبكة بعد $scoreA/100 • التحسّن $scImpr/100)\n\n")
-        if (audit.isNotEmpty()) sb.append("🧪 فحص الراوتر:\n").append(audit.joinToString("\n")).append("\n\n")
-        if (report.isNotEmpty()) sb.append("🛠 ما تم تنفيذه:\n").append(report.joinToString("\n")).append("\n\n")
-        sb.append("🧭 ترتيب أسرع DNS:\n").append(dnsRankText()).append("\n\n")
-        sb.append(diagText).append("\n\n")
-        sb.append("📊 المقارنة قبل ← بعد\n")
-        sb.append("السرعة: ${fmt(beforeSpeed)} ← ${fmt(after)}\n")
-        sb.append("Ping: ${pingLine(pingB)}\n  ← ${pingLine(pa)}\n")
-        sb.append("الراوتر: ${ms(gwBefore)} ← ${ms(gwAfter)}\n")
-        sb.append("درجة صحة الشبكة: $scoreB ← $scoreA\n")
-        if (prev > 0) sb.append("🕘 آخر فحص سابق: ${fmt(prev.toDouble())}\n")
-        if (after > 0) sp.edit().putFloat("last", after.toFloat()).apply()
-        sb.append("\n🎯 التشخيص النهائي: $primary\n").append(advice(after, pa))
-        sb.append(manual())
-        sb.append("\n\n🚪 تم تسجيل الخروج من الراوتر")
-        if (hasBackup()) sb.append("\n↩ تقدر ترجّع إعدادات الراوتر السابقة بزر «استرجاع».")
-        lastReport = sb.toString()
-
-        runOnUiThread {
-            if (pct >= 0) {
-                resultCard.alpha = 0f; resultCard.visibility = View.VISIBLE
-                resultCard.animate().alpha(1f).setDuration(500).start()
-                val col = if (pct >= 80) cGreen else if (pct >= 55) cAmber else cRed
-                resultPct.setTextColor(col)
-                resultBarV.progressTintList = ColorStateList.valueOf(col)
-                verdictTv.text = imp.first; verdictTv.setTextColor(imp.third)
-                resultSub.text = imp.second + "\n\nنسبة النجاح: " + (if (pct >= 80) "ممتازة 🟢" else if (pct >= 55) "جيدة 🟡" else "تحتاج تدخلاً 🔴") +
-                    "\nاكتمال المهام $scTasks/100  •  صحة الشبكة $scoreA/100  •  التحسّن $scImpr/100"
-                ValueAnimator.ofInt(0, pct).setDuration(1200).apply {
-                    addUpdateListener { a -> val v = a.animatedValue as Int; resultPct.text = "$v%"; resultBarV.progress = v }
-                }.start()
-            }
-        }
-        setReport(lastReport)
-        setChip(if (pct >= 55 || pct < 0) "● اكتمل" else "● يحتاج تدخل", if (pct >= 55 || pct < 0) cGreen else cAmber)
-        log("🏁 انتهى الاختبار" + (if (pct >= 0) " — نسبة النجاح $pct%" else ""))
-        endRun()
-    }
-}
+            if (plan.chan && okList.any { it.startsWith("القناة: كانت") }) {
+                if (verifyChan(plan.ch, plan.wid)) okList += "القناة: بقيت ${plan.ch} بعد إعادة التشغيل"
+                else failList += "القناة: لم تثبت القيمة بعد إعادة التشغيل"
+                val (_, _, f) = wifiInfoSafe()
+                if (f in 2400..2500) {
+                    val pc = if (f == 2484) 14 else (f - 2407) / 5
+                    if (pc == plan.ch) okList += "القناة: الهاتف يرصد الراوتر فعلاً على القناة $pc"
+                    else failList += "القناة: الهاتف يرصد الراوتر عل
