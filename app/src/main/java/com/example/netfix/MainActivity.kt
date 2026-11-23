@@ -234,7 +234,6 @@ class MainActivity : Activity() {
         "google.com", "youtube.com", "facebook.com", "wikipedia.org",
         "amazon.com", "instagram.com", "whatsapp.com", "tiktok.com"
     )
-
     // ================= بناء الواجهة =================
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -342,3 +341,196 @@ class MainActivity : Activity() {
         inCard.visibility = View.GONE
         dash.addView(inCard)
 
+        // الأزرار
+        startBtn = gradBtn("🔄 إعادة الفحص والتحسين", cCyan, cBlue)
+        startBtn.setOnClickListener { if (!busy) startRun(false) }
+        dash.addView(startBtn)
+
+        stopBtn = Button(this).apply {
+            text = "⛔ إيقاف العملية"; setAllCaps(false); textSize = 13f; setTextColor(Color.WHITE)
+            background = bg(Color.parseColor("#7F1D1D"), 14)
+            layoutParams = LinearLayout.LayoutParams(-1, dp(44)).apply { topMargin = dp(8) }
+            visibility = View.GONE
+            setOnClickListener { if (busy) { cancelled.set(true); log("⛔ طُلب الإيقاف، أُنهي المهام الجارية...") } }
+        }
+        dash.addView(stopBtn)
+
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) }
+        }
+        fixBtn = smallBtn("🔁 إعادة المحاولة").apply { isEnabled = false; setOnClickListener { if (!busy) startRun(false) } }
+        restoreBtn = smallBtn("↩ استرجاع").apply { isEnabled = hasBackup(); setOnClickListener { if (!busy) startRun(true) } }
+        val copyBtn = smallBtn("📋 نسخ التقرير").apply { setOnClickListener { copyReport() } }
+        val settingsBtn = smallBtn("⚙ بيانات الراوتر").apply {
+            setOnClickListener { if (!busy) showWizard(1, "") }
+        }
+        row.addView(fixBtn); row.addView(restoreBtn); row.addView(copyBtn); row.addView(settingsBtn)
+        dash.addView(row)
+
+        resultCard = cardBox().apply { visibility = View.GONE }
+        resultCard.addView(label("🏆 نتيجة التحسين ونسبة نجاح الاختبار", 13f, cMuted))
+        verdictTv = label("", 17f, cText, true).apply { gravity = Gravity.CENTER; setPadding(0, dp(8), 0, 0) }
+        resultCard.addView(verdictTv)
+        resultPct = label("0%", 46f, cGreen, true).apply { gravity = Gravity.CENTER; setPadding(0, dp(6), 0, 0) }
+        resultCard.addView(resultPct)
+        resultBarV = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100; progress = 0; progressTintList = ColorStateList.valueOf(cGreen)
+            layoutParams = LinearLayout.LayoutParams(-1, dp(10)).apply { topMargin = dp(6) }
+        }
+        resultCard.addView(resultBarV)
+        resultSub = label("", 13f, cText).apply { gravity = Gravity.CENTER; setPadding(0, dp(8), 0, 0) }
+        resultCard.addView(resultSub)
+        dash.addView(resultCard)
+
+        // مراحل العمل
+        val stepsCard = cardBox()
+        stepsCard.addView(label("📋 مراحل العمل", 13f, cMuted))
+        bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100; progress = 0
+            progressTintList = ColorStateList.valueOf(cCyan)
+            layoutParams = LinearLayout.LayoutParams(-1, dp(8)).apply { topMargin = dp(8); bottomMargin = dp(6) }
+        }
+        stepsCard.addView(bar)
+        stepNames.forEachIndexed { i, n ->
+            val tv = label("⚪  $n", 14f, cMuted).apply { setPadding(0, dp(5), 0, dp(5)) }
+            stepViews.add(tv); stepsCard.addView(tv)
+            stepState[i] = 0
+        }
+        dash.addView(stepsCard)
+
+        // مقارنة السرعة
+        val spCard = cardBox()
+        spCard.addView(label("📈 السرعة (تنزيل)", 13f, cMuted))
+        val spRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) }
+        }
+        val (b1, t1) = statBox("قبل", cAmber); beforeTv = t1
+        val (b2, t2) = statBox("بعد", cGreen); afterTv = t2
+        val (b3, t3) = statBox("التحسّن", cMuted); gainTv = t3
+        spRow.addView(b1); spRow.addView(b2); spRow.addView(b3)
+        spCard.addView(spRow)
+        dash.addView(spCard)
+
+        val pgCard = cardBox()
+        pgCard.addView(label("⏱ استقرار الاتصال (Ping) ودرجة صحة الشبكة", 13f, cMuted))
+        pingTv = label("بعد الفحص تظهر هنا نتائج الاستجابة والتذبذب وفقد الحزم قبل وبعد الإصلاح", 13f, cText).apply { setPadding(0, dp(8), 0, 0) }
+        pgCard.addView(pingTv)
+        dash.addView(pgCard)
+
+        val dnsCard = cardBox()
+        dnsCard.addView(label("🧭 ترتيب أسرع DNS (قياس حي)", 13f, cMuted))
+        dnsTv = label("سيظهر ترتيب أسرع DNS بعد القياس", 12f, cText).apply { typeface = Typeface.MONOSPACE; setPadding(0, dp(8), 0, 0) }
+        dnsCard.addView(dnsTv)
+        dash.addView(dnsCard)
+
+        // السجل المباشر
+        val logCard = cardBox()
+        logCard.addView(label("🛰 ما يحدث الآن", 13f, cMuted))
+        logView = label("بانتظار البدء...", 12f, Color.parseColor("#A7F3D0")).apply {
+            typeface = Typeface.MONOSPACE; setPadding(0, dp(8), 0, 0)
+        }
+        logCard.addView(logView)
+        dash.addView(logCard)
+
+        // التقرير النهائي
+        reportCard = cardBox().apply { visibility = View.GONE }
+        reportCard.addView(label("🧾 التقرير", 13f, cMuted))
+        reportView = label("", 13f, cText).apply { setPadding(0, dp(8), 0, 0); setTextIsSelectable(true) }
+        reportCard.addView(reportView)
+        dash.addView(reportCard)
+
+        dashScroll.addView(dash)
+
+        // شاشة الراوتر المباشرة (قابلة للتكبير والتصغير)
+        val webPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(cCard)
+            layoutParams = LinearLayout.LayoutParams(-1, 0, 1.1f)
+        }
+        val bar2 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+        }
+        liveWeb = label("🖥 شاشة الراوتر المباشرة", 12f, cCyan, true).apply {
+            setSingleLine(); ellipsize = android.text.TextUtils.TruncateAt.END
+            layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+        }
+        val zOut = toolChip("➖"); val zIn = toolChip("➕")
+        modeBtn = toolChip("⛶ تكبير")
+        zOut.setOnClickListener { web.zoomOut() }
+        zIn.setOnClickListener { web.zoomIn() }
+        modeBtn.setOnClickListener {
+            webFull = !webFull
+            dashScroll.visibility = if (webFull) View.GONE else View.VISIBLE
+            modeBtn.text = if (webFull) "⤓ اللوحة" else "⛶ تكبير"
+        }
+        bar2.addView(liveWeb); bar2.addView(zOut); bar2.addView(zIn); bar2.addView(modeBtn)
+        webPanel.addView(bar2)
+
+        web = WebView(this).apply {
+            settings.javaScriptEnabled = true; settings.domStorageEnabled = true
+            settings.setSupportZoom(true); settings.builtInZoomControls = true
+            settings.displayZoomControls = false
+            settings.useWideViewPort = true; settings.loadWithOverviewMode = true
+            settings.allowFileAccess = false
+            setBackgroundColor(Color.WHITE)
+            layoutParams = LinearLayout.LayoutParams(-1, 0, 1f)
+            webViewClient = routerClient
+            webChromeClient = object : WebChromeClient() {
+                private fun risky(m: String): Boolean {
+                    val ic = RegexOption.IGNORE_CASE
+                    val rb = Regex("reboot|restart|إعادة تشغيل|اعادة تشغيل", ic).containsMatchIn(m)
+                    return Regex("factory|مصنع", ic).containsMatchIn(m) ||
+                        (!rb && Regex("default|restore|reset|افتراض", ic).containsMatchIn(m))
+                }
+                // لا يُؤكَّد أي مربع حوار من الراوتر إلا بعد موافقة المستخدم على الإجراء، ولا يُؤكَّد أبداً إن كان فيه إعادة ضبط
+                override fun onJsConfirm(v: WebView, url: String, message: String, result: JsResult): Boolean {
+                    if (risky(message) || !approved.get()) result.cancel() else result.confirm()
+                    return true
+                }
+                override fun onJsAlert(v: WebView, url: String, message: String, result: JsResult): Boolean { result.confirm(); return true }
+            }
+        }
+        webPanel.addView(web)
+
+        root.addView(dashScroll); root.addView(webPanel)
+        val frame = FrameLayout(this)
+        frame.addView(root, FrameLayout.LayoutParams(-1, -1))
+        buildWizard()
+        frame.addView(wizard, FrameLayout.LayoutParams(-1, -1))
+        setContentView(frame)
+        showWizard(1, "")
+        checkResume()
+    }
+
+    // ================= دورة الحياة والصلاحيات =================
+    private fun hasLoc() = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        locGranted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+        if (!locGranted) Toast.makeText(this, "بدون صلاحية الموقع لن يعمل مسح القنوات وسيُتخطى", Toast.LENGTH_LONG).show()
+    }
+
+    override fun onDestroy() {
+        destroyed = true
+        cancelled.set(true)
+        ui.removeCallbacksAndMessages(null)
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            cm.bindProcessToNetwork(null)
+        } catch (e: Exception) {}
+        try {
+            web.stopLoading()
+            (web.parent as? ViewGroup)?.removeView(web)
+            web.destroy()
+        } catch (e: Exception) {}
+        super.onDestroy()
+    }
+
+    override fun onBackPressed() {
+        if (wizard.visibility == View.VISIBLE && wizP2.visibility == View.VISIBLE) { showWizard(1, ""); return }
+        if (busy) {
+            AlertDialog.Builder(this).setTitle("عملية جارية").setMessage
