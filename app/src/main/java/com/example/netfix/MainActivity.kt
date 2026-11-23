@@ -1,12 +1,14 @@
 package com.example.netfix
 
 import android.Manifest
+import android.animation.ObjectAnimator
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Typeface
@@ -29,6 +31,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
+import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import org.json.JSONObject
@@ -76,6 +79,8 @@ class MainActivity : Activity() {
     private lateinit var beforeTv: TextView
     private lateinit var afterTv: TextView
     private lateinit var gainTv: TextView
+    private lateinit var pingTv: TextView
+    private lateinit var autoSw: Switch
     private lateinit var logView: TextView
     private lateinit var reportCard: LinearLayout
     private lateinit var reportView: TextView
@@ -114,6 +119,10 @@ class MainActivity : Activity() {
     private var loginTries = 0
     private var rebootTry = 0
     private var gwIp = ""
+    private var pingB: Triple<Double, Double, Int> = Triple(-1.0, 0.0, 0)
+    private var pingA: Triple<Double, Double, Int>? = null
+    private var scoreB = 0
+    private var scoreA = 0
     private var primary = ""
     private var diagText = ""
     private var lastReport = ""
@@ -162,14 +171,14 @@ class MainActivity : Activity() {
     }
 
     private fun gradBtn(t: String, c1: Int, c2: Int) = Button(this).apply {
-        text = t; isAllCaps = false; textSize = 16f; setTextColor(Color.WHITE)
+        text = t; setAllCaps(false); textSize = 16f; setTextColor(Color.WHITE)
         setTypeface(typeface, Typeface.BOLD)
         background = GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, intArrayOf(c1, c2)).apply { cornerRadius = dp(16).toFloat() }
         layoutParams = LinearLayout.LayoutParams(-1, dp(54)).apply { topMargin = dp(12) }
     }
 
     private fun smallBtn(t: String) = Button(this).apply {
-        text = t; isAllCaps = false; textSize = 12f; setTextColor(cText)
+        text = t; setAllCaps(false); textSize = 12f; setTextColor(cText)
         background = bg(Color.parseColor("#17233D"), 12, cLine)
         layoutParams = LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginEnd = dp(6) }
     }
@@ -229,6 +238,13 @@ class MainActivity : Activity() {
         userEt = field("اسم المستخدم (اختياري للدخول التلقائي)")
         passEt = field("كلمة المرور (اختياري، لا تُحفظ)", true)
         inCard.addView(ip); inCard.addView(userEt); inCard.addView(passEt)
+        autoSw = Switch(this).apply {
+            text = "⚡ بدء تلقائي عند فتح التطبيق"; setTextColor(cText); textSize = 13f
+            isChecked = getSharedPreferences("nf", 0).getBoolean("auto", true)
+            setOnCheckedChangeListener { _, c -> getSharedPreferences("nf", 0).edit().putBoolean("auto", c).apply() }
+            layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) }
+        }
+        inCard.addView(autoSw)
         dash.addView(inCard)
 
         // الأزرار
@@ -278,6 +294,12 @@ class MainActivity : Activity() {
         spRow.addView(b1); spRow.addView(b2); spRow.addView(b3)
         spCard.addView(spRow)
         dash.addView(spCard)
+
+        val pgCard = cardBox()
+        pgCard.addView(label("⏱ استقرار الاتصال (Ping) ودرجة صحة الشبكة", 13f, cMuted))
+        pingTv = label("بعد الفحص تظهر هنا نتائج الاستجابة والتذبذب وفقد الحزم قبل وبعد الإصلاح", 13f, cText).apply { setPadding(0, dp(8), 0, 0) }
+        pgCard.addView(pingTv)
+        dash.addView(pgCard)
 
         // السجل المباشر
         val logCard = cardBox()
@@ -347,6 +369,14 @@ class MainActivity : Activity() {
 
         root.addView(dashScroll); root.addView(webPanel)
         setContentView(root)
+        if (autoSw.isChecked) {
+            log("⚡ سيبدأ الفحص والإصلاح تلقائياً خلال 4 ثوانٍ (ألغِ المفتاح لإيقاف ذلك)")
+            ui.postDelayed({
+                if (!autoSw.isChecked || running || diagBusy) return@postDelayed
+                if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) startBtn.performClick()
+                else log("📍 امنح صلاحية الموقع ثم اضغط «ابدأ»")
+            }, 4000)
+        }
     }
 
     // ================= السجل والحالة =================
@@ -374,7 +404,7 @@ class MainActivity : Activity() {
             val col = when (st) { 1 -> cAmber; 2 -> cGreen; else -> cMuted }
             stepViews[i].text = "$icon  ${stepNames[i]}"
             stepViews[i].setTextColor(col)
-            bar.progress = stepState.count { it == 2 || it == 3 } * 100 / stepState.size
+            ObjectAnimator.ofInt(bar, "progress", stepState.count { it == 2 || it == 3 } * 100 / stepState.size).setDuration(450).start()
         }
     }
 
@@ -382,13 +412,42 @@ class MainActivity : Activity() {
         for (i in stepState.indices) setStep(i, 0)
         runOnUiThread {
             beforeTv.text = "—"; afterTv.text = "—"; gainTv.text = "—"; gainTv.setTextColor(cMuted)
+            pingTv.text = "جارٍ القياس..."
             reportCard.visibility = View.GONE
         }
     }
 
-    private fun setReport(t: String) = runOnUiThread { reportView.text = t; reportCard.visibility = View.VISIBLE }
+    private fun setReport(t: String) = runOnUiThread {
+        reportView.text = t
+        if (reportCard.visibility != View.VISIBLE) {
+            reportCard.alpha = 0f; reportCard.visibility = View.VISIBLE
+            reportCard.animate().alpha(1f).setDuration(450).start()
+        }
+    }
 
     private fun mb(x: Double) = if (x < 0) "—" else "%.1f".format(x)
+
+    // درجة صحة الشبكة من 100 (استجابة + تذبذب + فقد حزم + سرعة)
+    private fun health(avg: Double, j: Double, l: Int, sp: Double): Int {
+        var s = 100.0
+        s -= if (avg < 0) 40.0 else Math.min(25.0, Math.max(0.0, (avg - 30) / 4))
+        s -= Math.min(25.0, j * 2.5)
+        s -= Math.min(25.0, l * 5.0)
+        s -= if (sp < 0) 15.0 else if (sp < 5) 25.0 else if (sp < 15) 15.0 else if (sp < 30) 8.0 else 0.0
+        return s.coerceIn(0.0, 100.0).toInt()
+    }
+
+    private fun verdict(sc: Int) = if (sc >= 85) "ممتاز 🟢" else if (sc >= 65) "جيد 🟡" else if (sc >= 40) "ضعيف 🟠" else "سيئ 🔴"
+
+    private fun pingLine(p: Triple<Double, Double, Int>) =
+        if (p.first < 0) "فشل القياس" else "${p.first.toInt()}ms | تذبذب ${p.second.toInt()}ms | فقد ${p.third}%"
+
+    private fun updatePingCard() {
+        val a = pingA
+        val txt = "قبل: ${pingLine(pingB)}\nدرجة الصحة: $scoreB/100 (${verdict(scoreB)})\n\n" +
+            (if (a == null) "بعد: —" else "بعد: ${pingLine(a)}\nدرجة الصحة: $scoreA/100 (${verdict(scoreA)})")
+        runOnUiThread { pingTv.text = txt }
+    }
 
     private fun copyReport() {
         val text = if (lastReport.isNotEmpty()) lastReport else synchronized(logLines) { logLines.joinToString("\n") }
@@ -612,6 +671,9 @@ class MainActivity : Activity() {
                 say("⏳ فحص استقرار الإنترنت (20 قياساً)..."); val (netMs, jitter, netLoss) = pingStats(20)
                 say("⏳ اختبار السرعة (قد يستغرق دقيقة)..."); val (sp, loaded) = speedRetry(); beforeSpeed = sp
                 runOnUiThread { beforeTv.text = mb(sp) }
+                pingB = Triple(netMs, jitter, netLoss); pingA = null
+                scoreB = health(netMs, jitter, netLoss, sp)
+                updatePingCard()
                 setStep(0, 2)
                 lowSpeed = sp in 0.0..5.0
                 lineProblem = netLoss > 5 || netMs > 120
@@ -662,7 +724,7 @@ class MainActivity : Activity() {
                     "🔎 الأسباب:\n" + causes.joinToString("\n")
                 setReport(diagText + "\n\n🎯 الخطة: قناة $bestCh + DNS $bestDns")
                 diagBusy = false
-                runOnUiThread { fixBtn.isEnabled = true; if (auto) applyFixes() else startBtn.isEnabled = true }
+                runOnUiThread { fixBtn.isEnabled = true; if (auto) { applyFixes() } else { startBtn.isEnabled = true } }
             } catch (e: Exception) {
                 diagBusy = false
                 log("❌ خطأ أثناء الفحص: ${e.message} (تأكد من تفعيل الموقع وصلاحيات الواي فاي)")
@@ -1026,12 +1088,18 @@ class MainActivity : Activity() {
     private fun showFinal(msg: String, after: Double) {
         val sp = getSharedPreferences("nf", 0)
         val prev = sp.getFloat("last", -1f)
+        log("⏱ أقيس استقرار الـ Ping بعد الإصلاح...")
+        val pa = pingStats(20)
+        pingA = pa
+        scoreA = health(pa.first, pa.second, pa.third, after)
+        updatePingCard()
         val sb = StringBuilder()
         sb.append(msg).append("\n\n")
         if (audit.isNotEmpty()) sb.append("🧪 فحص الراوتر:\n").append(audit.joinToString("\n")).append("\n\n")
         if (report.isNotEmpty()) sb.append("🛠 ما تم تنفيذه:\n").append(report.joinToString("\n")).append("\n\n")
         sb.append(diagText).append("\n\n")
         sb.append("📈 السرعة قبل: ${fmt(beforeSpeed)}\n📈 السرعة بعد: ${fmt(after)}\n")
+        sb.append("⏱ Ping قبل: ${pingLine(pingB)}\n⏱ Ping بعد: ${pingLine(pa)}\n🏥 درجة صحة الشبكة: $scoreB ← $scoreA\n")
         if (prev > 0) sb.append("🕘 آخر فحص سابق: ${fmt(prev.toDouble())}\n")
         if (after > 0) sp.edit().putFloat("last", after.toFloat()).apply()
         sb.append("\n🎯 التشخيص النهائي: $primary\n").append(advice(after))
