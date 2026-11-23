@@ -582,25 +582,41 @@ class MainActivity : Activity() {
     }
 
     private fun benchmarkDns(): List<Pair<String, Double>> {
-        val all = (ispDns() + dnsCandidates).distinct()
+        // نقيس المرشحين العشرة فقط حتى تكون القائمة المعروضة عشرة خوادم بالضبط.
         val results = java.util.Collections.synchronizedList(mutableListOf<Pair<String, Double>>())
-        val ts = all.map { s -> thread { results.add(s to dnsScore(s)) } }
-        ts.forEach { it.join(30000) }
-        return ArrayList(results).filter { it.second < 1400 }.sortedBy { it.second }
+        val ts = dnsCandidates.distinct().map { server ->
+            thread(name = "dns-${server.replace('.', '-')}") {
+                results.add(server to dnsScore(server))
+            }
+        }
+        ts.forEach { it.join(35000) }
+        return ArrayList(results)
+            .filter { it.second < 1400.0 }
+            .sortedBy { it.second }
+            .take(10)
     }
 
     private fun chooseDns(ranked: List<Pair<String, Double>>) {
-        if (ranked.isEmpty()) { dnsWorth = false; dnsReport = "🧭 تعذّر قياس DNS"; return }
+        if (ranked.isEmpty()) {
+            dnsWorth = false
+            dnsReport = "🧭 تعذّر قياس خوادم DNS العشرة؛ لن أغيّر إعداد DNS تلقائياً."
+            return
+        }
         val cur = ispDns().firstOrNull()
-        val curScore = ranked.firstOrNull { it.first == cur }?.second
-        val best = ranked[0]
+        val curScore = if (cur == null) null else {
+            ranked.firstOrNull { it.first == cur }?.second ?: run {
+                val measured = dnsScore(cur)
+                if (measured < 1400.0) measured else null
+            }
+        }
+        val best = ranked.first()
         bestDns = best.first
-        bestDns2 = ranked.getOrNull(1)?.first ?: "8.8.8.8"
-        dnsWorth = curScore == null || best.second < curScore * 0.9
-        if (!dnsWorth) bestDns = cur ?: best.first
-        dnsReport = "🧭 أفضل DNS: ${best.first} (${best.second.toInt()}ms)" +
-            (if (curScore != null) " | الحالي $cur (${curScore.toInt()}ms)" else "") +
-            if (dnsWorth) " ← سيتغيّر" else " ← الحالي مناسب"
+        bestDns2 = ranked.getOrNull(1)?.first ?: best.first
+        dnsWorth = curScore == null || best.second < curScore * 0.90
+        if (!dnsWorth && cur != null) bestDns = cur
+        dnsReport = "🧭 أسرع DNS مقاس: ${best.first} (${best.second.toInt()}ms)" +
+            (if (curScore != null) " | الحالي $cur (${curScore.toInt()}ms)" else " | تعذّر قياس الحالي") +
+            if (dnsWorth) " ← مرشح للتطبيق" else " ← الحالي قريب من الأفضل؛ لا تغيير"
     }
 
     private fun pickChannel(wm: WifiManager, curCh: Int): ChanScan {
@@ -628,17 +644,46 @@ class MainActivity : Activity() {
         return Pair(if (ok.isEmpty()) -1.0 else ok.average(), (n - ok.size) * 100 / n)
     }
 
-    private fun pingStats(n: Int): Triple<Double, Double, Int> {
-        val t = mutableListOf<Long>()
-        for (i in 1..n) {
-            val x = dnsUdp("1.1.1.1")
-            if (x >= 0) t.add(x)
-            Thread.sleep(100)
+    private fun icmpPing(host: String): Long {
+        return try {
+            val start = System.nanoTime()
+            val process = ProcessBuilder("ping", "-c", "1", "-W", "2", host)
+                .redirectErrorStream(true)
+                .start()
+            val output = process.inputStream.bufferedReader().use { it.readText() }
+            val finished = process.waitFor()
+            if (finished != 0) return -1L
+
+            val reported = Regex("time[=<]([0-9.]+)\\s*ms", RegexOption.IGNORE_CASE)
+                .find(output)?.groupValues?.getOrNull(1)?.toDoubleOrNull()
+            if (reported != null) reported.toLong()
+            else ((System.nanoTime() - start) / 1_000_000L).coerceAtLeast(1L)
+        } catch (_: Exception) {
+            -1L
         }
-        val avg = if (t.isEmpty()) -1.0 else t.average()
-        var j = 0.0
-        for (i in 1 until t.size) j += Math.abs(t[i] - t[i - 1]).toDouble()
-        return Triple(avg, if (t.size > 1) j / (t.size - 1) else 0.0, (n - t.size) * 100 / n)
+    }
+
+    private fun pingStats(n: Int): Triple<Double, Double, Int> {
+        val samples = mutableListOf<Long>()
+        var usedIcmp = true
+        for (i in 1..n) {
+            var x = icmpPing("1.1.1.1")
+            if (x < 0) {
+                usedIcmp = false
+                // Fallback: DNS response time, not an ICMP ping measurement.
+                x = dnsUdp("1.1.1.1")
+            }
+            if (x >= 0) samples.add(x)
+            Thread.sleep(120)
+        }
+        val avg = if (samples.isEmpty()) -1.0 else samples.average()
+        var jitter = 0.0
+        for (i in 1 until samples.size) {
+            jitter += kotlin.math.abs(samples[i] - samples[i - 1]).toDouble()
+        }
+        val loss = ((n - samples.size) * 100 / n)
+        if (!usedIcmp) log("ℹ تعذّر ICMP على هذا الجهاز؛ تم استخدام زمن استجابة DNS كقياس بديل وليس Ping حقيقياً.")
+        return Triple(avg, if (samples.size > 1) jitter / (samples.size - 1) else 0.0, loss)
     }
 
     private fun speedLoaded(): Pair<Double, Double> {
@@ -1070,16 +1115,29 @@ class MainActivity : Activity() {
     }
 
     private fun awaitInternet() {
-        val t0 = System.currentTimeMillis()
-        var n = 0
-        while (System.currentTimeMillis() - t0 < 90_000L) {
+        // لا نبدأ فحص السرعة لمجرد عودة صفحة الراوتر؛ ننتظر عودة الإنترنت أيضاً.
+        val started = System.currentTimeMillis()
+        var lastMessage = 0L
+        var internetBack = false
+        while (System.currentTimeMillis() - started < 120_000L) {
             bindToWifi()
-            if (dnsUdp("1.1.1.1") >= 0 || dnsUdp("8.8.8.8") >= 0) { log("🌐 الإنترنت رجع"); break }
-            if (n % 4 == 0) log("⏳ أنتظر عودة الإنترنت بعد إعادة التشغيل...")
-            n++
-            Thread.sleep(3000)
+            val ok = dnsUdp("1.1.1.1") >= 0 || dnsUdp("8.8.8.8") >= 0
+            if (ok) {
+                internetBack = true
+                log("🌐 عاد الإنترنت بعد إعادة التشغيل")
+                break
+            }
+            val elapsed = (System.currentTimeMillis() - started) / 1000L
+            if (elapsed - lastMessage >= 12L) {
+                lastMessage = elapsed
+                log("⏳ الراوتر متصل؛ أنتظر عودة الإنترنت قبل فحص الجودة (${elapsed}ث)")
+            }
+            Thread.sleep(2500)
         }
-        Thread.sleep(4000)
+        if (!internetBack) {
+            log("⚠ انتهت مهلة انتظار الإنترنت؛ سأجري القياسات المتاحة وأوضح أي قياس فشل.")
+        }
+        Thread.sleep(2500)
     }
 
     // ================= مراقبة إعادة التشغيل (لا تتوقف أبداً: تكمل للفحص والنتيجة دائماً) =================
@@ -1179,15 +1237,26 @@ class MainActivity : Activity() {
     private fun doLogout() {
         val latch = java.util.concurrent.CountDownLatch(1)
         runOnUiThread {
-            web.evaluateJavascript(logoutJs, null)
-            ui.postDelayed({
-                CookieManager.getInstance().removeAllCookies(null)
-                web.clearCache(true); web.loadUrl("about:blank")
+            try {
+                web.evaluateJavascript(logoutJs, null)
+                ui.postDelayed({
+                    try {
+                        CookieManager.getInstance().removeAllCookies(null)
+                        web.clearCache(true)
+                        web.loadUrl("about:blank")
+                        loggedOut = true
+                    } catch (_: Exception) {
+                        loggedOut = false
+                    } finally {
+                        latch.countDown()
+                    }
+                }, 1800)
+            } catch (_: Exception) {
+                loggedOut = false
                 latch.countDown()
-            }, 2000)
+            }
         }
         latch.await(6, java.util.concurrent.TimeUnit.SECONDS)
-        loggedOut = true
     }
 
     private fun endRun() {
@@ -1212,7 +1281,7 @@ class MainActivity : Activity() {
     // ================= ترتيب الـ DNS ونسبة النجاح =================
     private fun dnsRankText(): String {
         if (dnsRank.isEmpty()) return "لم يتم القياس"
-        return dnsRank.take(11).mapIndexed { i, p ->
+        return dnsRank.take(10).mapIndexed { i, p ->
             val name = (dnsNames[p.first] ?: "DNS المزوّد") + (if (p.first == curDnsAtStart) " (الحالي)" else "")
             val mark = if (p.first == bestDns) " ⭐" else if (p.first == bestDns2) " ✔" else ""
             "${i + 1}. $name ${p.first} — ${p.second.toInt()}ms$mark"
