@@ -21,6 +21,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.text.InputType
+import android.text.method.DigitsKeyListener
 import android.view.Gravity
 import android.view.View
 import android.webkit.CookieManager
@@ -52,6 +53,8 @@ import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 data class ChanScan(
     val best: Int,
@@ -222,6 +225,58 @@ class MainActivity : Activity() {
         layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) }
     }
 
+    // إجبار حقول عناوين IP على الأرقام الإنجليزية واتجاه الكتابة من اليسار لليمين.
+    private fun configureIpField(v: EditText) {
+        v.setTextDirection(View.TEXT_DIRECTION_LTR)
+        v.textLocale = Locale.US
+        v.gravity = Gravity.CENTER_VERTICAL or Gravity.LEFT
+        v.inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+        v.keyListener = DigitsKeyListener.getInstance("0123456789.")
+    }
+
+    private fun addDeveloperMarquee(parent: LinearLayout) {
+        val lane = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(8) }
+            background = GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,
+                intArrayOf(Color.parseColor("#10251D"), Color.parseColor("#183A2A"), Color.parseColor("#10251D"))).apply {
+                cornerRadius = dp(14).toFloat()
+                setStroke(dp(1), Color.parseColor("#39FF88"))
+            }
+            clipChildren = true
+            clipToPadding = true
+        }
+        val ad = TextView(this).apply {
+            text = "✦ مطور البرنامج: محمد إبراهيم ✦"
+            textSize = 16f
+            setTypeface(typeface, Typeface.BOLD)
+            setTextColor(Color.parseColor("#B7FF00"))
+            setShadowLayer(dp(10).toFloat(), 0f, 0f, Color.parseColor("#39FF88"))
+            gravity = Gravity.CENTER
+            setSingleLine(true)
+            layoutParams = FrameLayout.LayoutParams(-2, -1, Gravity.CENTER)
+        }
+        lane.addView(ad)
+        parent.addView(lane)
+        ad.post {
+            val travel = (lane.width / 2f + ad.width / 2f).coerceAtLeast(dp(90).toFloat())
+            ValueAnimator.ofFloat(-travel, travel).apply {
+                duration = 4200L
+                repeatCount = ValueAnimator.INFINITE
+                repeatMode = ValueAnimator.REVERSE
+                addUpdateListener { ad.translationX = it.animatedValue as Float }
+                start()
+            }
+            ValueAnimator.ofObject(android.animation.ArgbEvaluator(),
+                Color.parseColor("#B7FF00"), Color.parseColor("#39FF88"), Color.parseColor("#22D3EE")).apply {
+                duration = 1500L
+                repeatCount = ValueAnimator.INFINITE
+                repeatMode = ValueAnimator.REVERSE
+                addUpdateListener { ad.setTextColor(it.animatedValue as Int) }
+                start()
+            }
+        }
+    }
+
     private fun gradBtn(t: String, c1: Int, c2: Int) = Button(this).apply {
         text = t; setAllCaps(false); textSize = 16f; setTextColor(Color.WHITE)
         setTypeface(typeface, Typeface.BOLD)
@@ -283,6 +338,7 @@ class MainActivity : Activity() {
         }
         header.addView(titles); header.addView(chip)
         dash.addView(header)
+        addDeveloperMarquee(dash)
 
         // التحليل الذكي المحلي القابل للتفسير
         aiAnalysisCard = cardBox()
@@ -295,7 +351,7 @@ class MainActivity : Activity() {
         // بيانات الراوتر
         val inCard = cardBox()
         inCard.addView(label("🌐 بيانات الراوتر", 13f, cMuted))
-        ip = field("عنوان الراوتر (IP)").apply { setText(gateway()) }
+        ip = field("عنوان الراوتر (IP)").apply { configureIpField(this); setText(gateway()) }
         userEt = field("اسم المستخدم (اختياري للدخول التلقائي)")
         passEt = field("كلمة المرور (اختياري، لا تُحفظ)", true)
         inCard.addView(ip); inCard.addView(userEt); inCard.addView(passEt)
@@ -481,14 +537,19 @@ class MainActivity : Activity() {
         }
         col.addView(label("📡", 56f).apply { gravity = Gravity.CENTER })
         col.addView(label("NetFix Pro", 28f, cText, true).apply { gravity = Gravity.CENTER })
-        col.addView(label("تحسين سرعة واستقرار الإنترنت تلقائياً", 13f, cMuted).apply { gravity = Gravity.CENTER; setPadding(0, 0, 0, dp(24)) })
+        col.addView(label("تحسين سرعة واستقرار الإنترنت تلقائياً", 13f, cMuted).apply { gravity = Gravity.CENTER; setPadding(0, 0, 0, dp(8)) })
+        col.addView(label("✦ مطور البرنامج: محمد إبراهيم ✦", 15f, Color.parseColor("#B7FF00"), true).apply {
+            gravity = Gravity.CENTER
+            setShadowLayer(dp(8).toFloat(), 0f, 0f, Color.parseColor("#39FF88"))
+            setPadding(0, 0, 0, dp(20))
+        })
 
         wizP1 = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         wizP1.addView(label("الخطوة 1 من 2 — عنوان الراوتر", 15f, cCyan, true))
         wizP1.addView(label("اكتب IP الراوتر (غالباً مكتوب خلف الراوتر مثل 192.168.1.1). ملأت عنوان شبكتك الحالية تلقائياً.", 12f, cMuted).apply { setPadding(0, dp(6), 0, 0) })
         wizIp = field("عنوان الراوتر").apply {
+            configureIpField(this)
             setText(prefs.getString("router_ip", null) ?: gateway())
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
         }
         wizP1.addView(wizIp)
         val next1 = gradBtn("التالي ←", cCyan, cBlue)
@@ -720,7 +781,7 @@ class MainActivity : Activity() {
 
     private fun gateway(): String {
         val g = (applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager).dhcpInfo.gateway
-        return if (g == 0) "192.168.0.1" else "%d.%d.%d.%d".format(g and 255, g shr 8 and 255, g shr 16 and 255, g shr 24 and 255)
+        return if (g == 0) "192.168.0.1" else String.format(Locale.US, "%d.%d.%d.%d", g and 255, g shr 8 and 255, g shr 16 and 255, g shr 24 and 255)
     }
 
     // ================= النسخة الاحتياطية والاسترجاع =================
@@ -786,36 +847,44 @@ class MainActivity : Activity() {
 
     private fun ispDns(): List<String> {
         val d = (applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager).dhcpInfo
-        fun ipOf(g: Int) = if (g == 0) null else "%d.%d.%d.%d".format(g and 255, g shr 8 and 255, g shr 16 and 255, g shr 24 and 255)
+        fun ipOf(g: Int) = if (g == 0) null else String.format(Locale.US, "%d.%d.%d.%d", g and 255, g shr 8 and 255, g shr 16 and 255, g shr 24 and 255)
         return listOfNotNull(ipOf(d.dns1), ipOf(d.dns2))
     }
 
     // الدرجة تراعي السرعة والاستقرار ونسبة نجاح الاستعلامات، لا أقل قراءة لحظية فقط.
     private fun dnsScore(server: String): Double {
+        val sampleDomains = testDomains.take(4)
         val times = mutableListOf<Long>()
         var failed = 0
-        repeat(3) {
-            for (d in testDomains) {
-                val x = dnsQuery(server, d, 1200)
+        repeat(2) {
+            for (domain in sampleDomains) {
+                val x = dnsQuery(server, domain, 700)
                 if (x < 0) failed++ else times.add(x)
             }
         }
-        val total = testDomains.size * 3
-        if (times.size < total / 2) return 5000.0 + (total - times.size) * 10.0
+        val total = sampleDomains.size * 2
+        if (times.size < total / 2) return 5000.0 + (total - times.size) * 100.0
         val sorted = times.sorted()
         val median = sorted[sorted.size / 2].toDouble()
-        val p90 = sorted[((sorted.size - 1) * 9) / 10].toInt().toDouble()
+        val p90 = sorted[((sorted.size - 1) * 9) / 10].toDouble()
         val avg = times.average()
-        val lossPenalty = failed * 90.0
+        val lossPenalty = failed * 120.0
         return median * 0.40 + p90 * 0.25 + avg * 0.20 + lossPenalty
     }
 
     private fun benchmarkDns(): List<Pair<String, Double>> {
         val all = (ispDns() + dnsCandidates).distinct()
-        val results = java.util.Collections.synchronizedList(mutableListOf<Pair<String, Double>>())
-        val ts = all.map { s -> thread { results.add(s to dnsScore(s)) } }
-        ts.forEach { it.join(45000) }
-        return ArrayList(results).filter { it.second < 2500 }.sortedBy { it.second }
+        // حدّ التوازي يمنع فتح عشرات المقابس دفعة واحدة، ويقلل زمن الفحص على الهاتف.
+        val pool = Executors.newFixedThreadPool(6)
+        return try {
+            val futures = all.map { server -> pool.submit<Pair<String, Double>> { server to dnsScore(server) } }
+            futures.mapNotNull { future ->
+                try { future.get(8, TimeUnit.SECONDS) }
+                catch (_: Exception) { null }
+            }.filter { it.second < 2500 }.sortedBy { it.second }
+        } finally {
+            pool.shutdownNow()
+        }
     }
 
     private fun validIpv4(value: String): Boolean {
@@ -891,10 +960,10 @@ class MainActivity : Activity() {
         val freq = HashMap<String, Int>()
 
         // نأخذ أفضل RSSI لكل نقطة وصول حتى لا نكرر الشبكة نفسها في حساب الازدحام.
-        repeat(3) {
+        repeat(2) {
             try {
                 wm.startScan()
-                Thread.sleep(2500)
+                Thread.sleep(1400)
                 wm.scanResults
                     .filter { it.frequency in 2412..2472 && it.BSSID != own }
                     .forEach { result ->
@@ -953,7 +1022,7 @@ class MainActivity : Activity() {
         for (i in 1..n) {
             val x = dnsUdp(bestDns)
             if (x >= 0) t.add(x)
-            Thread.sleep(100)
+            if (i < n) Thread.sleep(60)
         }
         val avg = if (t.isEmpty()) -1.0 else t.average()
         var j = 0.0
@@ -994,7 +1063,7 @@ class MainActivity : Activity() {
                 }
             } catch (e: Exception) {}
         }
-        val deadline = System.nanoTime() + 12_000_000_000L
+        val deadline = System.nanoTime() + 8_000_000_000L
         while (System.nanoTime() < deadline && workers.any { it.isAlive }) Thread.sleep(200)
         stop.set(true)
         val secs = (System.nanoTime() - start) / 1e9
@@ -1007,10 +1076,10 @@ class MainActivity : Activity() {
     }
 
     private fun speedRetry(): Pair<Double, Double> {
-        for (i in 1..4) {
+        for (i in 1..2) {
             val r = speedLoaded()
             if (r.first > 0) return r
-            Thread.sleep(5000)
+            if (i < 2) Thread.sleep(1200)
         }
         return Pair(-1.0, -1.0)
     }
@@ -1033,7 +1102,7 @@ class MainActivity : Activity() {
 
                 setStep(0, 1)
                 say("⏳ فحص الاتصال بالراوتر..."); val (gwMs, gwLoss) = stats({ tcp(gw, 80) }); gwBefore = gwMs
-                say("⏳ فحص استجابة DNS/UDP على الخادم المرشح ${bestDns} (20 قياساً؛ ليست ICMP Ping)..."); val (netMs, jitter, netLoss) = pingStats(20)
+                say("⏳ فحص استجابة DNS/UDP على الخادم المرشح ${bestDns} (12 قياساً؛ ليست ICMP Ping)..."); val (netMs, jitter, netLoss) = pingStats(12)
                 say("⏳ اختبار السرعة (قد يستغرق دقيقة)..."); val (sp, loaded) = speedRetry(); beforeSpeed = sp
                 runOnUiThread { beforeTv.text = mb(sp) }
                 pingB = Triple(netMs, jitter, netLoss); pingA = null
@@ -1054,7 +1123,7 @@ class MainActivity : Activity() {
                 setStep(1, 2)
 
                 setStep(2, 1)
-                say("⏳ مسح القنوات (3 مرات)...")
+                say("⏳ مسح القنوات (مسحان سريعان)...")
                 val cs = pickChannel(wm, curCh)
                 bestCh = cs.best
                 crowded = is24 && (cs.count > 5 || cs.curBad)
@@ -1518,7 +1587,7 @@ class MainActivity : Activity() {
             log("⏱ أقيس السرعة بعد الإصلاح...")
             val (after, _) = speedRetry()
             log("⏱ أقيس استجابة DNS/UDP بعد الإصلاح...")
-            val pa = pingStats(20)
+            val pa = pingStats(12)
             gwAfter = stats({ tcp(gwIp, 80) }).first
             pingA = pa
             scoreA = health(pa.first, pa.second, pa.third, after)
