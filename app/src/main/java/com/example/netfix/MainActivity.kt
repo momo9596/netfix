@@ -9,7 +9,6 @@ import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
-import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Typeface
@@ -749,7 +748,7 @@ class MainActivity : Activity() {
         val t = System.nanoTime()
         Socket().use { it.connect(InetSocketAddress(host, port), 1500) }
         (System.nanoTime() - t) / 1_000_000
-    } catch (e: Exception) { -1 }
+    } catch (e: Exception) { -1L }
 
     private fun dnsQuery(server: String, host: String, timeout: Int = 1500): Long {
         val id = (Math.random() * 65535).toInt()
@@ -769,9 +768,9 @@ class MainActivity : Activity() {
                 val idOk = buf[0] == q[0] && buf[1] == q[1]
                 val rcode = buf[3].toInt() and 15
                 val answers = ((buf[6].toInt() and 255) shl 8) or (buf[7].toInt() and 255)
-                if (idOk && rcode == 0 && answers > 0) ms else -1
+                if (idOk && rcode == 0 && answers > 0) ms else -1L
             }
-        } catch (e: Exception) { -1 }
+        } catch (e: Exception) { -1L }
     }
 
     private fun dnsUdp(server: String): Long = dnsQuery(server, "example.com")
@@ -787,7 +786,7 @@ class MainActivity : Activity() {
         repeat(2) {
             for (d in testDomains) {
                 val x = dnsQuery(server, d)
-                times.add(if (x < 0) 1500 else x)
+                times.add(if (x < 0) 1500L else x)
             }
         }
         val sorted = times.sorted()
@@ -1492,7 +1491,7 @@ class MainActivity : Activity() {
 
     private fun endRun() {
         running = false; restoring = false
-        try { (getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager).bindProcessToNetwork(null) } catch (_: Exception) {}
+        try { (getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager).bindProcessToNetwork(null) } catch (e: Exception) {}
         runOnUiThread { restoreBtn.isEnabled = hasBackup(); startBtn.isEnabled = true }
     }
 
