@@ -234,48 +234,6 @@ class MainActivity : Activity() {
         v.keyListener = DigitsKeyListener.getInstance("0123456789.")
     }
 
-    private fun addDeveloperMarquee(parent: LinearLayout) {
-        val lane = FrameLayout(this).apply {
-            layoutParams = LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(8) }
-            background = GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,
-                intArrayOf(Color.parseColor("#10251D"), Color.parseColor("#183A2A"), Color.parseColor("#10251D"))).apply {
-                cornerRadius = dp(14).toFloat()
-                setStroke(dp(1), Color.parseColor("#39FF88"))
-            }
-            clipChildren = true
-            clipToPadding = true
-        }
-        val ad = TextView(this).apply {
-            text = "✦ مطور البرنامج: محمد إبراهيم ✦"
-            textSize = 16f
-            setTypeface(typeface, Typeface.BOLD)
-            setTextColor(Color.parseColor("#B7FF00"))
-            setShadowLayer(dp(10).toFloat(), 0f, 0f, Color.parseColor("#39FF88"))
-            gravity = Gravity.CENTER
-            setSingleLine(true)
-            layoutParams = FrameLayout.LayoutParams(-2, -1, Gravity.CENTER)
-        }
-        lane.addView(ad)
-        parent.addView(lane)
-        ad.post {
-            val travel = (lane.width / 2f + ad.width / 2f).coerceAtLeast(dp(90).toFloat())
-            ValueAnimator.ofFloat(-travel, travel).apply {
-                duration = 4200L
-                repeatCount = ValueAnimator.INFINITE
-                repeatMode = ValueAnimator.REVERSE
-                addUpdateListener { ad.translationX = it.animatedValue as Float }
-                start()
-            }
-            ValueAnimator.ofObject(android.animation.ArgbEvaluator(),
-                Color.parseColor("#B7FF00"), Color.parseColor("#39FF88"), Color.parseColor("#22D3EE")).apply {
-                duration = 1500L
-                repeatCount = ValueAnimator.INFINITE
-                repeatMode = ValueAnimator.REVERSE
-                addUpdateListener { ad.setTextColor(it.animatedValue as Int) }
-                start()
-            }
-        }
-    }
 
     private fun gradBtn(t: String, c1: Int, c2: Int) = Button(this).apply {
         text = t; setAllCaps(false); textSize = 16f; setTextColor(Color.WHITE)
@@ -338,7 +296,6 @@ class MainActivity : Activity() {
         }
         header.addView(titles); header.addView(chip)
         dash.addView(header)
-        addDeveloperMarquee(dash)
 
         // التحليل الذكي المحلي القابل للتفسير
         aiAnalysisCard = cardBox()
@@ -538,11 +495,6 @@ class MainActivity : Activity() {
         col.addView(label("📡", 56f).apply { gravity = Gravity.CENTER })
         col.addView(label("NetFix Pro", 28f, cText, true).apply { gravity = Gravity.CENTER })
         col.addView(label("تحسين سرعة واستقرار الإنترنت تلقائياً", 13f, cMuted).apply { gravity = Gravity.CENTER; setPadding(0, 0, 0, dp(8)) })
-        col.addView(label("✦ مطور البرنامج: محمد إبراهيم ✦", 15f, Color.parseColor("#B7FF00"), true).apply {
-            gravity = Gravity.CENTER
-            setShadowLayer(dp(8).toFloat(), 0f, 0f, Color.parseColor("#39FF88"))
-            setPadding(0, 0, 0, dp(20))
-        })
 
         wizP1 = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         wizP1.addView(label("الخطوة 1 من 2 — عنوان الراوتر", 15f, cCyan, true))
@@ -814,9 +766,9 @@ class MainActivity : Activity() {
     }
 
     // ================= أدوات القياس الحقيقية =================
-    private fun tcp(host: String, port: Int): Long = try {
+    private fun tcp(host: String, port: Int, timeoutMs: Int = 900): Long = try {
         val t = System.nanoTime()
-        Socket().use { it.connect(InetSocketAddress(host, port), 1500) }
+        Socket().use { it.connect(InetSocketAddress(host, port), timeoutMs) }
         (System.nanoTime() - t) / 1_000_000
     } catch (e: Exception) { -1 }
 
@@ -843,7 +795,7 @@ class MainActivity : Activity() {
         } catch (e: Exception) { -1 }
     }
 
-    private fun dnsUdp(server: String): Long = dnsQuery(server, "example.com")
+    private fun dnsUdp(server: String, timeoutMs: Int = 1500): Long = dnsQuery(server, "example.com", timeoutMs)
 
     private fun ispDns(): List<String> {
         val d = (applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager).dhcpInfo
@@ -853,36 +805,46 @@ class MainActivity : Activity() {
 
     // الدرجة تراعي السرعة والاستقرار ونسبة نجاح الاستعلامات، لا أقل قراءة لحظية فقط.
     private fun dnsScore(server: String): Double {
-        val sampleDomains = testDomains.take(4)
+        // عينات من نطاقات مختلفة وعلى جولتين لتقليل أثر القراءة المحظوظة الواحدة.
+        val sampleDomains = testDomains.take(3)
         val times = mutableListOf<Long>()
         var failed = 0
         repeat(2) {
             for (domain in sampleDomains) {
-                val x = dnsQuery(server, domain, 700)
+                val x = dnsQuery(server, domain, 450)
                 if (x < 0) failed++ else times.add(x)
             }
         }
         val total = sampleDomains.size * 2
-        if (times.size < total / 2) return 5000.0 + (total - times.size) * 100.0
+        if (times.size < 4) return 5000.0 + (total - times.size) * 150.0
         val sorted = times.sorted()
         val median = sorted[sorted.size / 2].toDouble()
         val p90 = sorted[((sorted.size - 1) * 9) / 10].toDouble()
         val avg = times.average()
-        val lossPenalty = failed * 120.0
-        return median * 0.40 + p90 * 0.25 + avg * 0.20 + lossPenalty
+        val lossPenalty = failed * 160.0
+        return median * 0.40 + p90 * 0.30 + avg * 0.20 + lossPenalty
     }
 
     private fun benchmarkDns(): List<Pair<String, Double>> {
         val all = (ispDns() + dnsCandidates).distinct()
-        // حدّ التوازي يمنع فتح عشرات المقابس دفعة واحدة، ويقلل زمن الفحص على الهاتف.
-        val pool = Executors.newFixedThreadPool(6)
+        // مهلة كلية واحدة؛ لا ننتظر 8 ثوانٍ لكل Future بالتتابع.
+        val pool = Executors.newFixedThreadPool(8)
+        val completion = java.util.concurrent.ExecutorCompletionService<Pair<String, Double>>(pool)
+        val futures = mutableListOf<java.util.concurrent.Future<Pair<String, Double>>>()
         return try {
-            val futures = all.map { server -> pool.submit<Pair<String, Double>> { server to dnsScore(server) } }
-            futures.mapNotNull { future ->
-                try { future.get(8, TimeUnit.SECONDS) }
-                catch (_: Exception) { null }
-            }.filter { it.second < 2500 }.sortedBy { it.second }
+            all.forEach { server -> futures += completion.submit<Pair<String, Double>> { server to dnsScore(server) } }
+            val results = mutableListOf<Pair<String, Double>>()
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(9)
+            for (i in all.indices) {
+                val remaining = deadline - System.nanoTime()
+                if (remaining <= 0) break
+                val done = completion.poll(remaining, TimeUnit.NANOSECONDS) ?: break
+                try { results += done.get() } catch (_: Exception) { }
+            }
+            futures.filterNot { it.isDone }.forEach { it.cancel(true) }
+            results.filter { it.second < 2500 }.sortedBy { it.second }
         } finally {
+            futures.filterNot { it.isDone }.forEach { it.cancel(true) }
             pool.shutdownNow()
         }
     }
@@ -1020,9 +982,9 @@ class MainActivity : Activity() {
     private fun pingStats(n: Int): Triple<Double, Double, Int> {
         val t = mutableListOf<Long>()
         for (i in 1..n) {
-            val x = dnsUdp(bestDns)
+            val x = dnsUdp(bestDns, 700)
             if (x >= 0) t.add(x)
-            if (i < n) Thread.sleep(60)
+            if (i < n) Thread.sleep(40)
         }
         val avg = if (t.isEmpty()) -1.0 else t.average()
         var j = 0.0
@@ -1039,12 +1001,12 @@ class MainActivity : Activity() {
         val workers = (1..3).map {
             thread {
                 try {
-                    val c = URL("https://speed.cloudflare.com/__down?bytes=25000000").openConnection() as HttpURLConnection
+                    val c = URL("https://speed.cloudflare.com/__down?bytes=18000000").openConnection() as HttpURLConnection
                     conns.add(c)
                     c.connectTimeout = 5000; c.readTimeout = 10000
                     c.inputStream.use { s ->
                         val buf = ByteArray(65536)
-                        while (!stop.get()) {
+                        while (!stop.get() && bytes.get() < 18_000_000L) {
                             val r = s.read(buf)
                             if (r < 0) break
                             bytes.addAndGet(r.toLong())
@@ -1063,7 +1025,7 @@ class MainActivity : Activity() {
                 }
             } catch (e: Exception) {}
         }
-        val deadline = System.nanoTime() + 8_000_000_000L
+        val deadline = System.nanoTime() + 6_000_000_000L
         while (System.nanoTime() < deadline && workers.any { it.isAlive }) Thread.sleep(200)
         stop.set(true)
         val secs = (System.nanoTime() - start) / 1e9
@@ -1101,9 +1063,21 @@ class MainActivity : Activity() {
                 val curCh = if (is24) (info.frequency - 2407) / 5 else (info.frequency - 5000) / 5
 
                 setStep(0, 1)
-                say("⏳ فحص الاتصال بالراوتر..."); val (gwMs, gwLoss) = stats({ tcp(gw, 80) }); gwBefore = gwMs
-                say("⏳ فحص استجابة DNS/UDP على الخادم المرشح ${bestDns} (12 قياساً؛ ليست ICMP Ping)..."); val (netMs, jitter, netLoss) = pingStats(12)
-                say("⏳ اختبار السرعة (قد يستغرق دقيقة)..."); val (sp, loaded) = speedRetry(); beforeSpeed = sp
+                say("⏳ فحص الوصول إلى الراوتر..."); val (gwMs, gwLoss) = stats({ tcp(gw, 80) }, 5); gwBefore = gwMs
+
+                setStep(1, 1)
+                say("⏳ مقارنة خوادم DNS بالتوازي (عينات متعددة ومهلة كلية محددة)...")
+                val ranked = benchmarkDns()
+                dnsRank = ranked; curDnsAtStart = ispDns().firstOrNull() ?: ""
+                chooseDns(ranked)
+                renderDns()
+                say(dnsReport)
+                setStep(1, 2)
+
+                say("⏳ قياس استجابة DNS/UDP باستخدام الخادم المختار ${bestDns} (8 عينات؛ ليست ICMP Ping)...")
+                val (netMs, jitter, netLoss) = pingStats(8)
+                say("⏳ اختبار سرعة محدود المدة وحجم البيانات...")
+                val (sp, loaded) = speedRetry(); beforeSpeed = sp
                 runOnUiThread { beforeTv.text = mb(sp) }
                 pingB = Triple(netMs, jitter, netLoss); pingA = null
                 scoreB = health(netMs, jitter, netLoss, sp)
@@ -1113,17 +1087,8 @@ class MainActivity : Activity() {
                 lineProblem = netLoss > 5 || netMs > 120
                 val bloat = loaded > 0 && netMs > 0 && loaded - netMs > 150
 
-                setStep(1, 1)
-                say("⏳ قياس زمن استجابة استعلام DNS (8 نطاقات × كل خادم)...")
-                val ranked = benchmarkDns()
-                dnsRank = ranked; curDnsAtStart = ispDns().firstOrNull() ?: ""
-                chooseDns(ranked)
-                renderDns()
-                say(dnsReport)
-                setStep(1, 2)
-
                 setStep(2, 1)
-                say("⏳ مسح القنوات (مسحان سريعان)...")
+                say("⏳ مسح القنوات (عينتان قصيرتان لتقليل أثر نتائج Wi-Fi القديمة)...")
                 val cs = pickChannel(wm, curCh)
                 bestCh = cs.best
                 crowded = is24 && (cs.count > 5 || cs.curBad)
@@ -1587,8 +1552,8 @@ class MainActivity : Activity() {
             log("⏱ أقيس السرعة بعد الإصلاح...")
             val (after, _) = speedRetry()
             log("⏱ أقيس استجابة DNS/UDP بعد الإصلاح...")
-            val pa = pingStats(12)
-            gwAfter = stats({ tcp(gwIp, 80) }).first
+            val pa = pingStats(8)
+            gwAfter = stats({ tcp(gwIp, 80) }, 5).first
             pingA = pa
             scoreA = health(pa.first, pa.second, pa.third, after)
             updatePingCard()
