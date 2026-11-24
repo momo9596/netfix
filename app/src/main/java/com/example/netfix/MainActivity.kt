@@ -9,6 +9,7 @@ import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Typeface
@@ -52,7 +53,12 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
 
-data class ChanScan(val best: Int, val count: Int, val curBad: Boolean)
+data class ChanScan(
+    val best: Int,
+    val count: Int,
+    val curBad: Boolean,
+    val scores: List<Pair<Int, Double>> = emptyList()
+)
 
 @Suppress("DEPRECATION")
 class MainActivity : Activity() {
@@ -172,13 +178,16 @@ class MainActivity : Activity() {
 
     // 10 مزوّدين مختلفين (مرشّحون فقط)، والترتيب والاختيار بالقياس الحي
     private val dnsCandidates = listOf(
-        "1.1.1.1", "8.8.8.8", "9.9.9.9", "208.67.222.222", "94.140.14.140",
-        "76.76.2.0", "64.6.64.6", "4.2.2.1", "84.200.69.80", "8.26.56.26"
+        "1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4", "9.9.9.9", "149.112.112.112",
+        "208.67.222.222", "208.67.220.220", "94.140.14.140", "94.140.14.141",
+        "76.76.2.0", "76.76.10.0", "64.6.64.6", "64.6.65.6", "4.2.2.1",
+        "84.200.69.80", "8.26.56.26"
     )
     private val dnsNames = mapOf(
-        "1.1.1.1" to "Cloudflare", "8.8.8.8" to "Google", "9.9.9.9" to "Quad9",
-        "208.67.222.222" to "OpenDNS", "94.140.14.140" to "AdGuard", "76.76.2.0" to "Control D",
-        "64.6.64.6" to "Verisign", "4.2.2.1" to "Level3", "84.200.69.80" to "DNS.WATCH", "8.26.56.26" to "Comodo"
+        "1.1.1.1" to "Cloudflare", "1.0.0.1" to "Cloudflare", "8.8.8.8" to "Google", "8.8.4.4" to "Google",
+        "9.9.9.9" to "Quad9", "149.112.112.112" to "Quad9", "208.67.222.222" to "OpenDNS", "208.67.220.220" to "OpenDNS",
+        "94.140.14.140" to "AdGuard", "94.140.14.141" to "AdGuard", "76.76.2.0" to "Control D", "76.76.10.0" to "Control D",
+        "64.6.64.6" to "Verisign", "64.6.65.6" to "Verisign", "4.2.2.1" to "Level3", "84.200.69.80" to "DNS.WATCH", "8.26.56.26" to "Comodo"
     )
     private val testDomains = listOf(
         "google.com", "youtube.com", "facebook.com", "wikipedia.org",
@@ -375,7 +384,7 @@ class MainActivity : Activity() {
 
         val dnsCard = cardBox()
         dnsCard.addView(label("🧭 ترتيب أسرع DNS (قياس حي)", 13f, cMuted))
-        dnsTv = label("سيظهر ترتيب أسرع 10 DNS بعد القياس", 12f, cText).apply { typeface = Typeface.MONOSPACE; setPadding(0, dp(8), 0, 0) }
+        dnsTv = label("سيظهر ترتيب خوادم DNS بعد القياس", 12f, cText).apply { typeface = Typeface.MONOSPACE; setPadding(0, dp(8), 0, 0) }
         dnsCard.addView(dnsTv)
         dnsCard.addView(label("⚙ إعداد DNS المستهدف (اختياري)", 12f, cMuted).apply { setPadding(0, dp(12), 0, dp(2)) })
         dnsPrimaryEt = field("Primary DNS — اتركه فارغًا للاختيار الذكي")
@@ -748,7 +757,7 @@ class MainActivity : Activity() {
         val t = System.nanoTime()
         Socket().use { it.connect(InetSocketAddress(host, port), 1500) }
         (System.nanoTime() - t) / 1_000_000
-    } catch (e: Exception) { -1L }
+    } catch (e: Exception) { -1 }
 
     private fun dnsQuery(server: String, host: String, timeout: Int = 1500): Long {
         val id = (Math.random() * 65535).toInt()
@@ -768,9 +777,9 @@ class MainActivity : Activity() {
                 val idOk = buf[0] == q[0] && buf[1] == q[1]
                 val rcode = buf[3].toInt() and 15
                 val answers = ((buf[6].toInt() and 255) shl 8) or (buf[7].toInt() and 255)
-                if (idOk && rcode == 0 && answers > 0) ms else -1L
+                if (idOk && rcode == 0 && answers > 0) ms else -1
             }
-        } catch (e: Exception) { -1L }
+        } catch (e: Exception) { -1 }
     }
 
     private fun dnsUdp(server: String): Long = dnsQuery(server, "example.com")
@@ -781,25 +790,32 @@ class MainActivity : Activity() {
         return listOfNotNull(ipOf(d.dns1), ipOf(d.dns2))
     }
 
+    // الدرجة تراعي السرعة والاستقرار ونسبة نجاح الاستعلامات، لا أقل قراءة لحظية فقط.
     private fun dnsScore(server: String): Double {
         val times = mutableListOf<Long>()
-        repeat(2) {
+        var failed = 0
+        repeat(3) {
             for (d in testDomains) {
-                val x = dnsQuery(server, d)
-                times.add(if (x < 0) 1500L else x)
+                val x = dnsQuery(server, d, 1200)
+                if (x < 0) failed++ else times.add(x)
             }
         }
+        val total = testDomains.size * 3
+        if (times.size < total / 2) return 5000.0 + (total - times.size) * 10.0
         val sorted = times.sorted()
         val median = sorted[sorted.size / 2].toDouble()
-        return median * 0.6 + times.average() * 0.4
+        val p90 = sorted[((sorted.size - 1) * 9) / 10].toInt().toDouble()
+        val avg = times.average()
+        val lossPenalty = failed * 90.0
+        return median * 0.40 + p90 * 0.25 + avg * 0.20 + lossPenalty
     }
 
     private fun benchmarkDns(): List<Pair<String, Double>> {
         val all = (ispDns() + dnsCandidates).distinct()
         val results = java.util.Collections.synchronizedList(mutableListOf<Pair<String, Double>>())
         val ts = all.map { s -> thread { results.add(s to dnsScore(s)) } }
-        ts.forEach { it.join(30000) }
-        return ArrayList(results).filter { it.second < 1400 }.sortedBy { it.second }
+        ts.forEach { it.join(45000) }
+        return ArrayList(results).filter { it.second < 2500 }.sortedBy { it.second }
     }
 
     private fun validIpv4(value: String): Boolean {
@@ -840,21 +856,22 @@ class MainActivity : Activity() {
             dnsReport = if (dnsWorth) "🧭 تعذّر ترتيب الخوادم؛ سيتم استخدام DNS الذي أدخلته فقط" else "🧭 تعذّر قياس DNS؛ لن يتم تغييره تلقائيًا"
             return
         }
-        val cur = ispDns().firstOrNull()
-        val curScore = ranked.firstOrNull { it.first == cur }?.second
+        val currentPair = ispDns()
+        val cur = currentPair.getOrNull(0)
+        val cur2 = currentPair.getOrNull(1)
         val best = ranked[0]
         bestDns = best.first
-        bestDns2 = ranked.getOrNull(1)?.first ?: "8.8.8.8"
-        dnsWorth = curScore == null || best.second < curScore * 0.9
-        if (!dnsWorth) bestDns = cur ?: best.first
-        if (requestedDnsPrimary.isNotEmpty() || requestedDnsSecondary.isNotEmpty()) {
-            if (requestedDnsPrimary.isNotEmpty()) bestDns = requestedDnsPrimary
-            if (requestedDnsSecondary.isNotEmpty()) bestDns2 = requestedDnsSecondary
-            dnsWorth = true
-        }
-        dnsReport = "🧭 أقل زمن استجابة DNS: ${best.first} (${best.second.toInt()}ms)" +
-            (if (curScore != null) " | الحالي $cur (${curScore.toInt()}ms)" else "") +
-            if (dnsWorth) " ← سيتغيّر" else " ← الحالي مناسب"
+        // نختار خادمين مختلفين من نتائج القياس الحي؛ الأول للأولوية والثاني كاحتياطي.
+        bestDns2 = ranked.firstOrNull { it.first != bestDns }?.first ?:
+            when (bestDns) { "1.1.1.1" -> "1.0.0.1"; "8.8.8.8" -> "8.8.4.4"; else -> "1.1.1.1" }
+        if (requestedDnsPrimary.isNotEmpty()) bestDns = requestedDnsPrimary
+        if (requestedDnsSecondary.isNotEmpty()) bestDns2 = requestedDnsSecondary
+        dnsWorth = (cur != bestDns || cur2 != bestDns2)
+        val best2Score = ranked.firstOrNull { it.first == bestDns2 }?.second
+        dnsReport = "🧭 أفضل زوج حسب قياس السرعة والاستقرار: الأساسي $bestDns (${best.second.toInt()}ms)" +
+            " | الثانوي $bestDns2 (${best2Score?.toInt()?.toString() ?: "احتياطي"})" +
+            (if (cur != null || cur2 != null) " | الحالي $cur / ${cur2 ?: "غير محدد"}" else "") +
+            if (dnsWorth) " ← سيتم تحديث الأساسي والثانوي معًا" else " ← الزوج الحالي مطابق للاختيار"
     }
 
     private fun pickChannel(wm: WifiManager, curCh: Int): ChanScan = try {
@@ -863,24 +880,67 @@ class MainActivity : Activity() {
         log("⚠ تعذّر مسح القنوات (فعّل الموقع وامنح الصلاحية)"); ChanScan(6, 0, false)
     }
 
+    /**
+     * يفحص كل قنوات 2.4GHz من 1 إلى 13.
+     * درجة القناة تجمع قوة الشبكات القريبة مع وزن للتداخل حسب فرق رقم القناة.
+     * الشبكة الأقوى والقريبة في التردد تؤثر أكثر من الشبكة الضعيفة أو البعيدة.
+     */
     private fun pickChannelRaw(wm: WifiManager, curCh: Int): ChanScan {
-        val own = wm.connectionInfo.bssid
+        val own = try { wm.connectionInfo.bssid } catch (_: Exception) { null }
         val seen = HashMap<String, Int>()
         val freq = HashMap<String, Int>()
+
+        // نأخذ أفضل RSSI لكل نقطة وصول حتى لا نكرر الشبكة نفسها في حساب الازدحام.
         repeat(3) {
-            wm.startScan(); Thread.sleep(2500)
-            wm.scanResults.filter { it.frequency in 2400..2500 && it.BSSID != own }.forEach {
-                if (it.level > (seen[it.BSSID] ?: -200)) { seen[it.BSSID] = it.level; freq[it.BSSID] = it.frequency }
+            try {
+                wm.startScan()
+                Thread.sleep(2500)
+                wm.scanResults
+                    .filter { it.frequency in 2412..2472 && it.BSSID != own }
+                    .forEach { result ->
+                        val id = result.BSSID ?: return@forEach
+                        if (result.level > (seen[id] ?: -200)) {
+                            seen[id] = result.level
+                            freq[id] = result.frequency
+                        }
+                    }
+            } catch (_: SecurityException) {
+                throw IllegalStateException("صلاحية مسح شبكات Wi-Fi غير متاحة")
             }
         }
-        fun load(ch: Int): Double = seen.entries.sumOf { e ->
-            val apCh = (freq[e.key]!! - 2407) / 5
-            val d = Math.abs(apCh - ch)
-            if (d > 4) 0.0 else Math.pow(10.0, e.value / 10.0) * (5 - d) / 5.0
+
+        val networks = seen.mapNotNull { (bssid, level) ->
+            val mhz = freq[bssid] ?: return@mapNotNull null
+            val apChannel = ((mhz - 2407) / 5).coerceIn(1, 13)
+            Triple(apChannel, level, bssid)
         }
-        val best = listOf(1, 6, 11).minByOrNull { load(it) } ?: 6
-        val curBad = curCh != best && load(curCh) > load(best) * 2 && seen.isNotEmpty()
-        return ChanScan(best, seen.size, curBad)
+
+        // فرق قناة 0..4 يعني وجود تداخل ملحوظ ضمن عرض 20MHz تقريباً.
+        // نستخدم قوة نسبية محسوبة من RSSI لتجنب القيم الصغيرة جداً لـ dBm السالبة.
+        fun load(channel: Int): Double = networks.sumOf { network ->
+            val distance = kotlin.math.abs(network.first - channel)
+            if (distance > 4) 0.0
+            else {
+                val overlapWeight = (5 - distance) / 5.0
+                val signalPower = Math.pow(10.0, (network.second + 100.0) / 10.0)
+                signalPower * overlapWeight
+            }
+        }
+
+        val scores = (1..13).map { it to load(it) }
+        // عند التعادل نفضّل القناة الحالية لتجنب تغيير غير مفيد، ثم الرقم الأقل.
+        val best = scores.minWithOrNull(
+            compareBy<Pair<Int, Double>> { it.second }
+                .thenBy { if (it.first == curCh) 0 else 1 }
+                .thenBy { it.first }
+        )?.first ?: 6
+
+        val currentLoad = if (curCh in 1..13) load(curCh) else Double.MAX_VALUE
+        val bestLoad = load(best)
+        val curBad = curCh != best && networks.isNotEmpty() &&
+            currentLoad > bestLoad * 1.35
+
+        return ChanScan(best, networks.size, curBad, scores.sortedBy { it.second })
     }
 
     private fun stats(f: () -> Long, n: Int = 10): Pair<Double, Int> {
@@ -891,7 +951,7 @@ class MainActivity : Activity() {
     private fun pingStats(n: Int): Triple<Double, Double, Int> {
         val t = mutableListOf<Long>()
         for (i in 1..n) {
-            val x = dnsUdp("1.1.1.1")
+            val x = dnsUdp(bestDns)
             if (x >= 0) t.add(x)
             Thread.sleep(100)
         }
@@ -928,7 +988,7 @@ class MainActivity : Activity() {
             try {
                 Thread.sleep(1500)
                 while (!stop.get()) {
-                    val x = dnsUdp("1.1.1.1")
+                    val x = dnsUdp(bestDns)
                     if (x >= 0) lat.add(x)
                     Thread.sleep(300)
                 }
@@ -973,7 +1033,7 @@ class MainActivity : Activity() {
 
                 setStep(0, 1)
                 say("⏳ فحص الاتصال بالراوتر..."); val (gwMs, gwLoss) = stats({ tcp(gw, 80) }); gwBefore = gwMs
-                say("⏳ فحص استجابة استعلام DNS/UDP (20 قياساً؛ ليست ICMP Ping)..."); val (netMs, jitter, netLoss) = pingStats(20)
+                say("⏳ فحص استجابة DNS/UDP على الخادم المرشح ${bestDns} (20 قياساً؛ ليست ICMP Ping)..."); val (netMs, jitter, netLoss) = pingStats(20)
                 say("⏳ اختبار السرعة (قد يستغرق دقيقة)..."); val (sp, loaded) = speedRetry(); beforeSpeed = sp
                 runOnUiThread { beforeTv.text = mb(sp) }
                 pingB = Triple(netMs, jitter, netLoss); pingA = null
@@ -998,7 +1058,11 @@ class MainActivity : Activity() {
                 val cs = pickChannel(wm, curCh)
                 bestCh = cs.best
                 crowded = is24 && (cs.count > 5 || cs.curBad)
-                say("📡 أفضل قناة: $bestCh (${cs.count} شبكة مجاورة)")
+                val topChannels = cs.scores.take(5).joinToString("، ") { (ch, score) ->
+                    "$ch (${"%.2f".format(Locale.US, score)})"
+                }
+                say("📡 فحصت القنوات 1–13 | الأقل تداخلاً: $bestCh | الشبكات المرصودة: ${cs.count}")
+                if (topChannels.isNotEmpty()) say("📊 أفضل 5 قنوات حسب درجة التداخل: $topChannels")
                 setStep(2, 2)
 
                 val causes = mutableListOf<String>()
@@ -1010,7 +1074,7 @@ class MainActivity : Activity() {
                 if (gwLoss > 5 || gwMs > 40) causes += "🔌 اتصالك بالراوتر غير مستقر (فقد $gwLoss%، ${gwMs.toInt()}ms): مشكلة واي فاي أو راوتر مضغوط."
                 if (lineProblem) causes += "🌐 الإنترنت نفسه غير مستقر (${netMs.toInt()}ms، فقد $netLoss%، تذبذب ${jitter.toInt()}ms): غالباً الخط أو المزوّد."
                 if (bloat) causes += "📉 عند التحميل يرتفع زمن الاستجابة من ${netMs.toInt()} إلى ${loaded.toInt()}ms: أي تحميل يبطّئ باقي الأجهزة."
-                if (dnsWorth && ranked.isNotEmpty()) causes += "🧭 يوجد DNS أسرع بشكل واضح من الحالي ← الحل: $bestDns."
+                if (dnsWorth && ranked.isNotEmpty()) causes += "🧭 تم اختيار زوج DNS بناءً على السرعة والاستقرار ونسبة نجاح الاستعلامات ← الأساسي $bestDns والثانوي $bestDns2."
                 if (sp in 0.0..5.0) causes += "🐢 سرعة التحميل منخفضة جداً (${fmt(sp)})."
                 if (causes.isEmpty()) causes += "✅ لم أجد مشكلة واضحة."
 
@@ -1028,8 +1092,13 @@ class MainActivity : Activity() {
                     "استعلام DNS/UDP: ${netMs.toInt()}ms تذبذب ${jitter.toInt()}ms فشل ${netLoss}%\n" +
                     "السرعة: ${fmt(sp)} | زمن أثناء التحميل: ${if (loaded > 0) "${loaded.toInt()}ms" else "—"}\n" +
                     dnsReport + "\n\n" +
-                    "🔎 الأسباب:\n" + causes.joinToString("\n")
-                setReport(diagText + "\n\n🎯 الخطة: قناة $bestCh + DNS $bestDns")
+                    "🔎 الأسباب:\n" + causes.joinToString("\n") +
+                    "\n\n📡 تقييم قنوات 2.4GHz (الأقل تداخلاً أولاً):\n" +
+                    cs.scores.take(13).joinToString("\n") { (ch, score) ->
+                        "القناة $ch — درجة التداخل ${"%.2f".format(Locale.US, score)}" +
+                            (if (ch == bestCh) " ⭐ الاختيار المقترح" else "")
+                    }
+                setReport(diagText + "\n\n🎯 الخطة: قناة $bestCh + DNS أساسي $bestDns + DNS ثانوي $bestDns2")
                 diagBusy = false
                 runOnUiThread { fixBtn.isEnabled = true; if (auto) { applyFixes() } else { startBtn.isEnabled = true } }
             } catch (e: Exception) {
@@ -1491,7 +1560,7 @@ class MainActivity : Activity() {
 
     private fun endRun() {
         running = false; restoring = false
-        try { (getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager).bindProcessToNetwork(null) } catch (e: Exception) {}
+        try { (getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager).bindProcessToNetwork(null) } catch (_: Exception) {}
         runOnUiThread { restoreBtn.isEnabled = hasBackup(); startBtn.isEnabled = true }
     }
 
@@ -1512,7 +1581,7 @@ class MainActivity : Activity() {
     // ================= ترتيب الـ DNS ونسبة النجاح =================
     private fun dnsRankText(): String {
         if (dnsRank.isEmpty()) return "لم يتم القياس"
-        return dnsRank.take(11).mapIndexed { i, p ->
+        return "الاختيار التلقائي: أساسي $bestDns | ثانوي $bestDns2\n" + dnsRank.take(17).mapIndexed { i, p ->
             val name = (dnsNames[p.first] ?: "DNS المزوّد") + (if (p.first == curDnsAtStart) " (الحالي)" else "")
             val mark = if (p.first == bestDns) " ⭐" else if (p.first == bestDns2) " ✔" else ""
             "${i + 1}. $name ${p.first} — ${p.second.toInt()}ms$mark"
